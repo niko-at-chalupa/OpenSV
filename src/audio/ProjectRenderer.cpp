@@ -15,6 +15,7 @@
 #include <numbers>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace sv::audio
@@ -491,13 +492,20 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
             }
         }
     };
-    if (!note.phonemes.empty())
+    std::string_view explicitPhonemeText = note.phonemes;
+    bool hasExplicitPhonemes = !explicitPhonemeText.empty();
+    if (!hasExplicitPhonemes && !note.lyrics.empty() && note.lyrics.front() == '.')
     {
-        if (note.phonemes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) || note.phonemes.find('\0') != std::string::npos || !juce::CharPointer_UTF8::isValidString(note.phonemes.data(), static_cast<int>(note.phonemes.size())))
+        explicitPhonemeText = std::string_view(note.lyrics).substr(1);
+        hasExplicitPhonemes = true;
+    }
+    if (hasExplicitPhonemes)
+    {
+        if (explicitPhonemeText.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) || explicitPhonemeText.find('\0') != std::string_view::npos || !juce::CharPointer_UTF8::isValidString(explicitPhonemeText.data(), static_cast<int>(explicitPhonemeText.size())))
         {
             return juce::Result::fail("Explicit phonemes must be valid UTF-8 text.");
         }
-        auto fields = juce::StringArray::fromTokens(juce::String::fromUTF8(note.phonemes.data(), static_cast<int>(note.phonemes.size())), " \t\r\n", "");
+        auto fields = juce::StringArray::fromTokens(juce::String::fromUTF8(explicitPhonemeText.data(), static_cast<int>(explicitPhonemeText.size())), " \t\r\n", "");
         fields.removeEmptyStrings();
         if (fields.isEmpty())
         {
