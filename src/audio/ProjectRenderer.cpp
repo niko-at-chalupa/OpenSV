@@ -474,12 +474,23 @@ juce::Result ProjectRenderer::findVoice(const FileStamp& source, synthesis::Voic
     return juce::Result::ok();
 }
 
-juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, const Note& note, std::vector<std::string>& phonemes)
+juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, const Note& note, std::vector<std::string>& phonemes, std::string& continuationPhoneme)
 {
-    if (note.lyrics == "+" || note.lyrics == "-")
+    const auto selectContinuationPhoneme = [&phonemes, &continuationPhoneme](const synthesis::PhonemeDictionary& dictionary)
     {
-        return juce::Result::fail("Continuation lyrics (+/-) are not implemented; enter a complete syllable with its phonemes.");
-    }
+        continuationPhoneme = phonemes.empty() ? std::string{} : phonemes.back();
+        const auto& definitions = dictionary.getPhonemes();
+        for (auto phone = phonemes.rbegin(); phone != phonemes.rend(); ++phone)
+        {
+            const auto definition = std::find_if(definitions.begin(), definitions.end(), [&phone](const synthesis::PhonemeDefinition& candidate)
+                                                 { return candidate.symbol == *phone && (candidate.category == "vowel" || candidate.category == "diphthong"); });
+            if (definition != definitions.end())
+            {
+                continuationPhoneme = *phone;
+                return;
+            }
+        }
+    };
     if (!note.phonemes.empty())
     {
         if (note.phonemes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) || note.phonemes.find('\0') != std::string::npos || !juce::CharPointer_UTF8::isValidString(note.phonemes.data(), static_cast<int>(note.phonemes.size())))
@@ -497,6 +508,7 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
         {
             phonemes.push_back(field.toStdString());
         }
+        continuationPhoneme = phonemes.back();
         return juce::Result::ok();
     }
     const auto stem = dictionaryStem(settings.language);
@@ -538,7 +550,12 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
     if (found != dictionaries.end())
     {
         std::rotate(found, std::next(found), dictionaries.end());
-        return dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
+        const auto result = dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
+        if (result.wasOk())
+        {
+            selectContinuationPhoneme(dictionaries.back().dictionary);
+        }
+        return result;
     }
     synthesis::PhonemeDictionary dictionary;
     const auto loadResult = readingsSource.has_value() ? dictionary.loadMandarin(phonesSource.file, dictionarySource.file, readingsSource->file) : dictionary.load(phonesSource.file, dictionarySource.file);
@@ -551,7 +568,12 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
         dictionaries.erase(dictionaries.begin());
     }
     dictionaries.push_back({phonesSource, dictionarySource, readingsSource, std::move(dictionary)});
-    return dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
+    const auto result = dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
+    if (result.wasOk())
+    {
+        selectContinuationPhoneme(dictionaries.back().dictionary);
+    }
+    return result;
 }
 
 bool ProjectRenderer::matchesTiming(const CachedPhrase& cached, const FileStamp& voiceSource, const std::vector<synthesis::TimingSyllable>& syllables)
@@ -774,6 +796,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 }
                 std::vector<synthesis::TimingSyllable> syllables;
                 std::vector<synthesis::PitchNote> pitchNotes;
+                std::string continuationPhoneme;
                 double cursorSeconds = startSeconds;
                 std::size_t phonemeCount = 0;
                 for (std::size_t noteIndex = 0; noteIndex < notes.size(); ++noteIndex)
@@ -786,6 +809,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     const double gapSeconds = noteIndex == 0 ? restContextSeconds : note.startSeconds - cursorSeconds;
                     if (gapSeconds > 0.0)
                     {
+                        continuationPhoneme.clear();
                         syllables.push_back({track.voice.language, {"sil"}, gapSeconds, note.pitch});
                         synthesis::PitchNote silence;
                         silence.syllable = syllables.back();
@@ -797,9 +821,22 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                         ++phonemeCount;
                     }
                     std::vector<std::string> phonemes;
-                    if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes); result.failed())
+                    const bool isContinuation = note.note->lyrics == "+" || note.note->lyrics == "-";
+                    if (isContinuation)
+                    {
+                        if (continuationPhoneme.empty())
+                        {
+                            return trackError(track, noteContext(note) + "a continuation lyric (+/-) must immediately follow a note with a resolved syllable.");
+                        }
+                        phonemes.push_back(continuationPhoneme);
+                    }
+                    else if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme); result.failed())
                     {
                         return trackError(track, noteContext(note) + result.getErrorMessage());
+                    }
+                    if (phonemes.size() == 1 && (phonemes.front() == "sil" || phonemes.front() == "br"))
+                    {
+                        continuationPhoneme.clear();
                     }
                     phonemeCount += phonemes.size();
                     if (phonemeCount >= maximumPhrasePhonemes)
@@ -811,6 +848,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     pitchNote.syllable = syllables.back();
                     pitchNote.isSilence = pitchNote.syllable.phonemes.size() == 1 && pitchNote.syllable.phonemes.front() == "sil";
                     pitchNote.isBreath = pitchNote.syllable.phonemes.size() == 1 && pitchNote.syllable.phonemes.front() == "br";
+                    pitchNote.isContinuation = isContinuation;
                     pitchNote.isRap = note.note->musicalType == "rap";
                     if (note.note->accent.size() == 1 && note.note->accent.front() >= '1' && note.note->accent.front() <= '5')
                     {
