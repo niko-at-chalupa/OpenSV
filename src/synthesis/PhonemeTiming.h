@@ -20,6 +20,7 @@ struct TimingSyllable
     std::vector<std::string> phonemes;
     double durationSeconds = 0.0;
     int midiPitch = 60;
+    bool isContinuation = false;
 };
 
 struct PhonemeDuration

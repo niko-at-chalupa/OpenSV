@@ -27,6 +27,7 @@ struct PitchCurveNote
     double dF0Vbr = 1.0;
     double pF0Vbr = 0.0;
     double fF0Vbr = 5.5;
+    double rapIntonation = 0.0;
 };
 
 // All note fields must be finite. Notes must be ordered and nonoverlapping,

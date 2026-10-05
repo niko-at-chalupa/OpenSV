@@ -33,7 +33,9 @@ constexpr std::array pitchAttributeFields{
     PitchAttributeField{"dF0Vbr", &PitchAttributes::dF0Vbr},
     PitchAttributeField{"pF0Vbr", &PitchAttributes::pF0Vbr},
     PitchAttributeField{"fF0Vbr", &PitchAttributes::fF0Vbr},
-    PitchAttributeField{"dF0VbrMod", &PitchAttributes::dF0VbrMod}};
+    PitchAttributeField{"dF0VbrMod", &PitchAttributes::dF0VbrMod},
+    PitchAttributeField{"rTone", &PitchAttributes::rTone},
+    PitchAttributeField{"rIntonation", &PitchAttributes::rIntonation}};
 
 juce::var makeObject()
 {

@@ -78,6 +78,38 @@ bool samePitchNotes(std::span<const synthesis::PitchNote> first, std::span<const
                       { return left.syllable.language == right.syllable.language && left.syllable.phonemes == right.syllable.phonemes && left.syllable.durationSeconds == right.syllable.durationSeconds && left.syllable.midiPitch == right.syllable.midiPitch && left.isBreath == right.isBreath && left.isSilence == right.isSilence && left.isContinuation == right.isContinuation && left.isRap == right.isRap && left.tone == right.tone && left.vibratoModulation == right.vibratoModulation; });
 }
 
+bool isEnglishVowelPhoneme(std::string_view symbol)
+{
+    static constexpr std::array<std::string_view, 16> vowels{
+        "aa", "ae", "ah", "ao", "aw", "ax", "ay", "eh", "er", "ey", "ih", "iy", "ow", "oy", "uh", "uw"};
+    return std::find(vowels.begin(), vowels.end(), symbol) != vowels.end();
+}
+
+void mergeContinuationPhones(std::span<const synthesis::PhonemeDuration> durations, std::span<const synthesis::TimingSyllable> syllables, std::vector<synthesis::TimedPhoneme>& phonemes)
+{
+    if (durations.size() != phonemes.size())
+    {
+        return;
+    }
+    std::vector<synthesis::TimedPhoneme> merged;
+    merged.reserve(phonemes.size());
+    for (std::size_t index = 0; index < phonemes.size(); ++index)
+    {
+        const auto& duration = durations[index];
+        const auto& phoneme = phonemes[index];
+        const bool continuation = duration.syllableIndex < syllables.size() && syllables[duration.syllableIndex].isContinuation;
+        if (continuation && !merged.empty() && merged.back().language == phoneme.language && merged.back().symbol == phoneme.symbol && phoneme.frameCount <= std::numeric_limits<std::size_t>::max() - merged.back().frameCount)
+        {
+            merged.back().frameCount += phoneme.frameCount;
+        }
+        else
+        {
+            merged.push_back(phoneme);
+        }
+    }
+    phonemes = std::move(merged);
+}
+
 bool addBlicks(Blick first, Blick second, Blick& result)
 {
     if ((second > 0 && first > std::numeric_limits<Blick>::max() - second) || (second < 0 && first < std::numeric_limits<Blick>::min() - second))
@@ -249,6 +281,19 @@ double resolvePitchAttribute(const RenderNote& note, std::optional<double> Pitch
     return (note.reference->voicePitch.*field).value_or(manualDefault);
 }
 
+double resolveRapAttribute(const RenderNote& note, std::optional<double> PitchAttributes::* field)
+{
+    if ((note.note->attributes.*field).has_value())
+    {
+        return *(note.note->attributes.*field);
+    }
+    if (note.note->instantMode && (note.note->systemAttributes.*field).has_value())
+    {
+        return *(note.note->systemAttributes.*field);
+    }
+    return 0.0;
+}
+
 std::vector<float> buildVibratoEnvelope(const Project& project, std::span<const RenderNote> notes, double startSeconds, double frameIntervalSeconds, std::size_t frameCount)
 {
     std::vector<float> envelope(frameCount, 1.0f);
@@ -287,6 +332,11 @@ juce::Result buildPitch(const Project& project, std::span<const RenderNote> note
         // Regenerated gen5 attributes supersede an imported system curve. The
         // latter may belong to a different score, tempo, voice or model version.
         curve.midiPitch += note.note->detune / 100.0;
+        if (note.note->musicalType == "rap")
+        {
+            curve.midiPitch += resolveRapAttribute(note, &PitchAttributes::rTone);
+            curve.rapIntonation = resolveRapAttribute(note, &PitchAttributes::rIntonation);
+        }
         curve.tF0Offset = resolvePitchAttribute(note, &PitchAttributes::tF0Offset, 0.0, 0.0);
         curve.tF0Left = resolvePitchAttribute(note, &PitchAttributes::tF0Left, 0.1, curve.secondsPerQuarter * 0.2);
         curve.tF0Right = resolvePitchAttribute(note, &PitchAttributes::tF0Right, 0.07, curve.secondsPerQuarter * 0.2);
@@ -336,7 +386,9 @@ juce::Result buildPitch(const Project& project, std::span<const RenderNote> note
             automaticDelta = std::lerp(residual[left], residual[right], modelFrame - static_cast<double>(left));
         }
         const double cents = sampleParameterCurve(note.group->pitchDelta, position);
-        const double pitch = transitions[frame] + mask[frame] * automaticDelta + envelope[frame] * vibrato[frame] + cents / 100.0;
+        const double noteProgress = std::clamp((seconds - note.startSeconds) / (note.endSeconds - note.startSeconds), 0.0, 1.0);
+        const double rapIntonation = note.note->musicalType == "rap" ? editorNotes[noteIndex].rapIntonation * (noteProgress - 0.5) : 0.0;
+        const double pitch = transitions[frame] + mask[frame] * automaticDelta + envelope[frame] * vibrato[frame] + cents / 100.0 + rapIntonation;
         const double logarithmicPitch = std::log(440.0) + (pitch - 69.0) * std::numbers::ln2 / 12.0;
         const float frequency = std::exp(static_cast<float>(logarithmicPitch));
         if (!std::isfinite(pitch) || !std::isfinite(frequency) || frequency <= 0.0f)
@@ -517,6 +569,15 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
             phonemes.push_back(field.toStdString());
         }
         continuationPhoneme = phonemes.back();
+        if (settings.language == "english")
+        {
+            const auto vowel = std::find_if(phonemes.rbegin(), phonemes.rend(), [](const std::string& symbol)
+                                            { return isEnglishVowelPhoneme(symbol); });
+            if (vowel != phonemes.rend())
+            {
+                continuationPhoneme = *vowel;
+            }
+        }
         return juce::Result::ok();
     }
     const auto stem = dictionaryStem(settings.language);
@@ -587,7 +648,7 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
 bool ProjectRenderer::matchesTiming(const CachedPhrase& cached, const FileStamp& voiceSource, const std::vector<synthesis::TimingSyllable>& syllables)
 {
     return cached.voiceSource == voiceSource && cached.syllables.size() == syllables.size() && std::equal(cached.syllables.begin(), cached.syllables.end(), syllables.begin(), [](const auto& first, const auto& second)
-                                                                                                          { return first.language == second.language && first.phonemes == second.phonemes && first.durationSeconds == second.durationSeconds && first.midiPitch == second.midiPitch; });
+                                                                                                          { return first.language == second.language && first.phonemes == second.phonemes && first.durationSeconds == second.durationSeconds && first.midiPitch == second.midiPitch && first.isContinuation == second.isContinuation; });
 }
 
 std::size_t ProjectRenderer::phraseBytes(const CachedPhrase& phrase)
@@ -818,7 +879,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     if (gapSeconds > 0.0)
                     {
                         continuationPhoneme.clear();
-                        syllables.push_back({track.voice.language, {"sil"}, gapSeconds, note.pitch});
+                        syllables.push_back({track.voice.language, {"sil"}, gapSeconds, note.pitch, false});
                         synthesis::PitchNote silence;
                         silence.syllable = syllables.back();
                         silence.isSilence = true;
@@ -851,7 +912,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         return trackError(track, "The phrase exceeds the 4096-phoneme inference limit.");
                     }
-                    syllables.push_back({track.voice.language, std::move(phonemes), note.endSeconds - note.startSeconds, note.pitch});
+                    syllables.push_back({track.voice.language, std::move(phonemes), note.endSeconds - note.startSeconds, note.pitch, isContinuation});
                     synthesis::PitchNote pitchNote;
                     pitchNote.syllable = syllables.back();
                     pitchNote.isSilence = pitchNote.syllable.phonemes.size() == 1 && pitchNote.syllable.phonemes.front() == "sil";
@@ -866,7 +927,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     pitchNotes.push_back(std::move(pitchNote));
                     cursorSeconds = note.endSeconds;
                 }
-                syllables.push_back({track.voice.language, {"sil"}, restContextSeconds, notes.back().pitch});
+                syllables.push_back({track.voice.language, {"sil"}, restContextSeconds, notes.back().pitch, false});
                 ++statistics.totalPhrases;
                 // Timing can be reused before loading a model. The pitch comparison
                 // below uses exactly the samples sent to the acoustic model, including
@@ -902,6 +963,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         return trackError(track, noteContext(notes.front()) + "duration quantization: " + result.getErrorMessage());
                     }
+                    mergeContinuationPhones(durations, syllables, phonemes);
                 }
                 if (cancelled(shouldCancel))
                 {

@@ -26,6 +26,8 @@ struct PitchAttributes
     std::optional<double> pF0Vbr;
     std::optional<double> fF0Vbr;
     std::optional<double> dF0VbrMod;
+    std::optional<double> rTone;
+    std::optional<double> rIntonation;
     std::string preservedFieldsJson;
 };
 
