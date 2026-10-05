@@ -1049,7 +1049,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                         silence.isSilence = true;
                         if (noteIndex != 0)
                         {
-                            phonemeLanguage = wordSyllableLanguage;
+                            pitchNotes.push_back(std::move(silence));
                         }
                         ++phonemeCount;
                     }
