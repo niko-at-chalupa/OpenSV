@@ -608,6 +608,7 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
     std::optional<FileStamp> readingsSource;
     std::optional<FileStamp> hiraganaSource;
     std::optional<FileStamp> katakanaSource;
+    std::optional<FileStamp> smallKanaSource;
     if (settings.language == "mandarin")
     {
         readingsSource.emplace();
@@ -620,6 +621,7 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
     {
         hiraganaSource.emplace();
         katakanaSource.emplace();
+        smallKanaSource.emplace();
         if (const auto result = readFileStamp(directory.getChildFile("japanese-hira2romaji-dict.txt"), *hiraganaSource); result.failed())
         {
             return result;
@@ -628,9 +630,13 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
         {
             return result;
         }
+        if (const auto result = readFileStamp(directory.getChildFile("japanese-sute2romaji-dict.txt"), *smallKanaSource); result.failed())
+        {
+            return result;
+        }
     }
-    const auto found = std::find_if(dictionaries.begin(), dictionaries.end(), [&phonesSource, &dictionarySource, &readingsSource, &hiraganaSource, &katakanaSource](const CachedDictionary& entry)
-                                    { return entry.phonesSource == phonesSource && entry.dictionarySource == dictionarySource && entry.readingsSource == readingsSource && entry.hiraganaSource == hiraganaSource && entry.katakanaSource == katakanaSource; });
+    const auto found = std::find_if(dictionaries.begin(), dictionaries.end(), [&phonesSource, &dictionarySource, &readingsSource, &hiraganaSource, &katakanaSource, &smallKanaSource](const CachedDictionary& entry)
+                                    { return entry.phonesSource == phonesSource && entry.dictionarySource == dictionarySource && entry.readingsSource == readingsSource && entry.hiraganaSource == hiraganaSource && entry.katakanaSource == katakanaSource && entry.smallKanaSource == smallKanaSource; });
     if (found != dictionaries.end())
     {
         std::rotate(found, std::next(found), dictionaries.end());
@@ -643,7 +649,7 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
     }
     synthesis::PhonemeDictionary dictionary;
     const auto loadResult = readingsSource.has_value() ? dictionary.loadMandarin(phonesSource.file, dictionarySource.file, readingsSource->file)
-                              : hiraganaSource.has_value() && katakanaSource.has_value() ? dictionary.loadJapanese(phonesSource.file, dictionarySource.file, hiraganaSource->file, katakanaSource->file)
+                              : hiraganaSource.has_value() && katakanaSource.has_value() && smallKanaSource.has_value() ? dictionary.loadJapanese(phonesSource.file, dictionarySource.file, hiraganaSource->file, katakanaSource->file, smallKanaSource->file)
                                                                                           : dictionary.load(phonesSource.file, dictionarySource.file);
     if (loadResult.failed())
     {
@@ -653,7 +659,7 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
     {
         dictionaries.erase(dictionaries.begin());
     }
-    dictionaries.push_back({phonesSource, dictionarySource, readingsSource, hiraganaSource, katakanaSource, std::move(dictionary)});
+    dictionaries.push_back({phonesSource, dictionarySource, readingsSource, hiraganaSource, katakanaSource, smallKanaSource, std::move(dictionary)});
     const auto result = dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
     if (result.wasOk())
     {

@@ -52,6 +52,7 @@ private:
         std::optional<FileStamp> readingsSource;
         std::optional<FileStamp> hiraganaSource;
         std::optional<FileStamp> katakanaSource;
+        std::optional<FileStamp> smallKanaSource;
         synthesis::PhonemeDictionary dictionary;
     };
 

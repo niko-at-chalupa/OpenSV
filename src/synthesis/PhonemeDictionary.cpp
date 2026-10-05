@@ -209,7 +209,7 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
     return juce::Result::ok();
 }
 
-juce::Result PhonemeDictionary::loadJapanese(const juce::File& phonesFile, const juce::File& dictionaryFile, const juce::File& hiraganaFile, const juce::File& katakanaFile)
+juce::Result PhonemeDictionary::loadJapanese(const juce::File& phonesFile, const juce::File& dictionaryFile, const juce::File& hiraganaFile, const juce::File& katakanaFile, const juce::File& smallKanaFile)
 {
     PhonemeDictionary loaded;
     if (const auto result = loaded.load(phonesFile, dictionaryFile); result.failed())
@@ -217,7 +217,7 @@ juce::Result PhonemeDictionary::loadJapanese(const juce::File& phonesFile, const
         return result;
     }
 
-    for (const auto& mappingFile : {hiraganaFile, katakanaFile})
+    const auto loadKanaMappings = [](const juce::File& mappingFile, std::unordered_map<std::string, std::string>& mappings) -> juce::Result
     {
         juce::String mappingText;
         if (const auto result = readText(mappingFile, mappingText); result.failed())
@@ -238,14 +238,26 @@ juce::Result PhonemeDictionary::loadJapanese(const juce::File& phonesFile, const
             }
             const auto kana = fields[0].toStdString();
             const auto romaji = fields[1].toStdString();
-            const auto [found, inserted] = loaded.kanaToRomaji.emplace(kana, romaji);
+            const auto [found, inserted] = mappings.emplace(kana, romaji);
             if (!inserted && found->second != romaji)
             {
                 return lineError(mappingFile, line + 1, "Conflicting romaji for kana '" + fields[0] + "'.");
             }
         }
+        return juce::Result::ok();
+    };
+    for (const auto& mappingFile : {hiraganaFile, katakanaFile})
+    {
+        if (const auto result = loadKanaMappings(mappingFile, loaded.kanaToRomaji); result.failed())
+        {
+            return result;
+        }
     }
-    if (loaded.kanaToRomaji.empty())
+    if (const auto result = loadKanaMappings(smallKanaFile, loaded.smallKanaToRomaji); result.failed())
+    {
+        return result;
+    }
+    if (loaded.kanaToRomaji.empty() || loaded.smallKanaToRomaji.empty())
     {
         return juce::Result::fail("Japanese kana conversion dictionaries contain no entries.");
     }
@@ -380,12 +392,32 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
         {
             const auto kana = juce::String::charToString(text[index]).toStdString();
             const auto foundKana = kanaToRomaji.find(kana);
-            if (foundKana == kanaToRomaji.end())
+            if (foundKana != kanaToRomaji.end())
+            {
+                romanized += foundKana->second;
+                continue;
+            }
+            const auto foundSmallKana = smallKanaToRomaji.find(kana);
+            if (foundSmallKana == smallKanaToRomaji.end())
             {
                 allKana = false;
                 break;
             }
-            romanized += foundKana->second;
+            const auto& smallRomaji = foundSmallKana->second;
+            if (smallRomaji.size() == 2 && smallRomaji.front() == 'y' && !romanized.empty() && romanized.back() == 'i')
+            {
+                romanized.pop_back();
+                const bool digraphOnset = romanized.ends_with("sh") || romanized.ends_with("ch") || romanized.ends_with('j');
+                if (!digraphOnset)
+                {
+                    romanized.push_back('y');
+                }
+                romanized.push_back(smallRomaji.back());
+            }
+            else
+            {
+                romanized += smallRomaji;
+            }
         }
         if (allKana)
         {
