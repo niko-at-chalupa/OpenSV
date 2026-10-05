@@ -1122,17 +1122,29 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         pendingEnglishSyllables.clear();
                         nextEnglishSyllable = 0;
-                        if (phonemeLanguage == "english" && note.note->phonemes.empty())
+                        if (phonemeLanguage == "english" && !note.note->lyrics.empty() && note.note->lyrics.front() != '.')
                         {
-                            pendingEnglishSyllables = splitEnglishSyllables(phonemes);
-                            if (pendingEnglishSyllables.size() > 1)
+                            auto wordPhonemes = phonemes;
+                            if (!note.note->phonemes.empty())
                             {
-                                phonemes = std::move(pendingEnglishSyllables.front());
-                                nextEnglishSyllable = 1;
+                                auto inferredNote = *note.note;
+                                inferredNote.phonemes.clear();
+                                std::vector<std::string> inferredPhonemes;
+                                std::string ignoredContinuation;
+                                std::string inferredLanguage;
+                                if (resolvePhonemes(track.voice, inferredNote, inferredPhonemes, ignoredContinuation, inferredLanguage, continuationLanguage == "english").wasOk() && inferredLanguage == "english")
+                                {
+                                    wordPhonemes = std::move(inferredPhonemes);
+                                }
                             }
-                            else
+                            auto wordSyllables = splitEnglishSyllables(wordPhonemes);
+                            if (wordSyllables.size() > 1)
                             {
-                                pendingEnglishSyllables.clear();
+                                pendingEnglishSyllables.assign(std::make_move_iterator(std::next(wordSyllables.begin())), std::make_move_iterator(wordSyllables.end()));
+                                if (note.note->phonemes.empty())
+                                {
+                                    phonemes = std::move(wordSyllables.front());
+                                }
                             }
                         }
                     }
