@@ -27,8 +27,9 @@ public:
     [[nodiscard]] juce::Result load(const juce::File& phonesFile, const juce::File& dictionaryFile);
     [[nodiscard]] juce::Result loadMandarin(const juce::File& phonesFile, const juce::File& dictionaryFile, const juce::File& cedictFile);
 
-    // Generic dictionaries use exact, case-sensitive keys. Mandarin also accepts normalized
-    // pinyin and the first supported single-syllable CEDICT reading; it does not segment lyrics.
+    // Generic dictionaries try exact and ASCII case-insensitive keys. Uppercase English single
+    // letters are spelled out by name. Mandarin also accepts normalized pinyin and the first
+    // supported single-syllable CEDICT reading; it does not segment lyrics.
     // Both query methods leave output intact on failure and reject empty input.
     [[nodiscard]] juce::Result lookup(std::string_view lyrics, std::vector<std::string>& output) const;
     [[nodiscard]] juce::Result parseExplicitPhonemes(std::string_view text, std::vector<std::string>& output) const;
@@ -42,5 +43,6 @@ private:
     std::unordered_set<std::string> symbols;
     std::unordered_map<std::string, std::vector<std::string>> entries;
     bool isMandarin = false;
+    bool isEnglishArpabet = false;
 };
 } // namespace sv::synthesis

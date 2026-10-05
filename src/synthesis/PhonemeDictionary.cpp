@@ -146,6 +146,7 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
     }
 
     PhonemeDictionary loaded;
+    loaded.isEnglishArpabet = phonesFile.getFileName() == "english-arpabet-phones.txt";
     const auto phoneLines = juce::StringArray::fromLines(phonesText);
     for (int line = 0; line < phoneLines.size(); ++line)
     {
@@ -304,6 +305,27 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
     {
         return juce::Result::fail("Dictionary lookup requires exactly one key without surrounding whitespace.");
     }
+    static constexpr std::array<std::string_view, 26> englishLetterNames{
+        "ey", "b iy", "s iy", "d iy", "iy", "eh f", "jh iy", "ey ch", "ay", "jh ey", "k ey", "eh l", "eh m",
+        "eh n", "ow", "p iy", "k y uw", "aa r", "eh s", "t iy", "y uw", "v iy", "d ah b ah l y uw", "eh k s", "w ay", "z iy"};
+    if (isEnglishArpabet && lyrics.size() == 1 && lyrics.front() >= 'A' && lyrics.front() <= 'Z')
+    {
+        const auto spelling = englishLetterNames[static_cast<std::size_t>(lyrics.front() - 'A')];
+        const auto fields = juce::StringArray::fromTokens(juce::String::fromUTF8(spelling.data(), static_cast<int>(spelling.size())), " ", "");
+        std::vector<std::string> pronunciation;
+        pronunciation.reserve(static_cast<std::size_t>(fields.size()));
+        for (const auto& field : fields)
+        {
+            const auto symbol = field.toStdString();
+            if (!symbols.contains(symbol))
+            {
+                return juce::Result::fail("The phoneme inventory cannot spell the English letter '" + text + "'.");
+            }
+            pronunciation.push_back(symbol);
+        }
+        output = std::move(pronunciation);
+        return juce::Result::ok();
+    }
     const auto normalized = isMandarin ? normalizePinyin(text) : juce::String{};
     const auto key = normalized.isEmpty() ? std::string(lyrics) : normalized.toStdString();
     const auto found = entries.find(key);
@@ -319,6 +341,11 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
 
     std::string candidate = key;
     std::transform(candidate.begin(), candidate.end(), candidate.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (const auto caseInsensitive = entries.find(candidate); caseInsensitive != entries.end())
+    {
+        output = caseInsensitive->second;
+        return juce::Result::ok();
+    }
     candidate.erase(std::remove_if(candidate.begin(), candidate.end(), [](unsigned char c) { return !std::isalnum(c); }), candidate.end());
     if (candidate.empty())
     {
