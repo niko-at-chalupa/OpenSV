@@ -100,6 +100,31 @@ if(MSVC)
     target_compile_options(OpenSVEngine PRIVATE /utf-8 /permissive- /EHsc)
 endif()
 
+# Headless command-line renderer: SVP in, WAV out, no GUI or audio device.
+juce_add_console_app(OpenSVCli
+    PRODUCT_NAME "opensv-cli"
+    COMPANY_NAME "OpenSV"
+    BUNDLE_ID "org.opensv.cli"
+)
+set_target_properties(OpenSVCli PROPERTIES OUTPUT_NAME "opensv-cli")
+target_sources(OpenSVCli PRIVATE src/cli/Main.cpp)
+target_compile_definitions(OpenSVCli PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+)
+target_link_libraries(OpenSVCli PRIVATE
+    OpenSVEngine
+    juce::juce_core
+    juce::juce_audio_basics
+    juce::juce_audio_formats
+    juce::juce_dsp
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags
+)
+if(MSVC)
+    target_compile_options(OpenSVCli PRIVATE /utf-8 /permissive- /EHsc)
+endif()
+
 option(OPENSV_BUILD_INTERNAL_TOOLS "Build internal voice diagnostics" OFF)
 if(OPENSV_BUILD_INTERNAL_TOOLS)
     juce_add_console_app(OpenSVVoice
