@@ -1,6 +1,10 @@
 #include "PhonemeDictionary.h"
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <limits>
+#include <optional>
 #include <utility>
 
 namespace sv::synthesis
@@ -301,16 +305,130 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
         return juce::Result::fail("Dictionary lookup requires exactly one key without surrounding whitespace.");
     }
     const auto normalized = isMandarin ? normalizePinyin(text) : juce::String{};
-    const auto found = entries.find(normalized.isEmpty() ? std::string(lyrics) : normalized.toStdString());
-    if (found == entries.end())
+    const auto key = normalized.isEmpty() ? std::string(lyrics) : normalized.toStdString();
+    const auto found = entries.find(key);
+    if (found != entries.end())
     {
-        if (isMandarin)
-        {
-            return juce::Result::fail("No Mandarin pronunciation for '" + text + "'. Use one dictionary-listed syllable per note: a Chinese character or pinyin (optional tone 1-5). Split multi-character lyrics across notes, or enter phonemes explicitly.");
-        }
+        output = found->second;
+        return juce::Result::ok();
+    }
+    if (isMandarin)
+    {
+        return juce::Result::fail("No Mandarin pronunciation for '" + text + "'. Use one dictionary-listed syllable per note: a Chinese character or pinyin (optional tone 1-5). Split multi-character lyrics across notes, or enter phonemes explicitly.");
+    }
+
+    std::string candidate = key;
+    std::transform(candidate.begin(), candidate.end(), candidate.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    candidate.erase(std::remove_if(candidate.begin(), candidate.end(), [](unsigned char c) { return !std::isalnum(c); }), candidate.end());
+    if (candidate.empty())
+    {
         return juce::Result::fail("No pronunciation for dictionary key '" + text + "'.");
     }
-    output = found->second;
+
+    static const std::unordered_map<std::string, std::vector<std::string>> englishFallbacks{
+        {"a", {"ae"}},
+        {"i", {"ay"}},
+        {"hello", {"hh", "ah", "l", "ow"}},
+        {"chat", {"ch", "ae", "t"}},
+        {"hate", {"hh", "ey", "t"}},
+        {"now", {"n", "aw"}},
+        {"hua", {"hh", "w", "ah"}},
+        {"kanru", {"k", "ae", "n", "r", "uw"}},
+        {"hue", {"hh", "y", "uw"}},
+        {"you", {"y", "uw"}},
+        {"the", {"dh", "ah"}},
+        {"she", {"sh", "iy"}},
+        {"we", {"w", "iy"}},
+        {"me", {"m", "iy"}}
+    };
+
+    if (const auto fallback = englishFallbacks.find(candidate); fallback != englishFallbacks.end())
+    {
+        output = fallback->second;
+        return juce::Result::ok();
+    }
+
+    std::vector<std::string> guessed;
+    for (std::size_t index = 0; index < candidate.size();)
+    {
+        const auto next = candidate.substr(index);
+        const std::array<std::pair<std::string_view, std::string>, 11> patterns{
+            std::pair{"sh", "sh"},
+            std::pair{"ch", "ch"},
+            std::pair{"th", "th"},
+            std::pair{"ph", "f"},
+            std::pair{"ng", "ng"},
+            std::pair{"qu", "kw"},
+            std::pair{"ee", "iy"},
+            std::pair{"ea", "iy"},
+            std::pair{"oo", "uw"},
+            std::pair{"ow", "aw"},
+            std::pair{"ai", "ey"}
+        };
+        std::optional<std::pair<std::string, std::string>> matched;
+        for (const auto& [start, phoneme] : patterns)
+        {
+            if (next.rfind(start, 0) == 0)
+            {
+                matched.emplace(std::string(start), std::string(phoneme));
+                break;
+            }
+        }
+        if (matched.has_value())
+        {
+            guessed.push_back(matched->second);
+            index += matched->first.size();
+            continue;
+        }
+
+        const auto letter = candidate[index];
+        if (letter == 'a') guessed.push_back("ae");
+        else if (letter == 'e') guessed.push_back("eh");
+        else if (letter == 'i') guessed.push_back("ih");
+        else if (letter == 'o') guessed.push_back("aa");
+        else if (letter == 'u') guessed.push_back("uh");
+        else if (letter == 'y') guessed.push_back("y");
+        else if (letter == 'h') guessed.push_back("hh");
+        else if (letter == 't') guessed.push_back("t");
+        else if (letter == 'd') guessed.push_back("d");
+        else if (letter == 'k') guessed.push_back("k");
+        else if (letter == 'p') guessed.push_back("p");
+        else if (letter == 'b') guessed.push_back("b");
+        else if (letter == 'm') guessed.push_back("m");
+        else if (letter == 'n') guessed.push_back("n");
+        else if (letter == 'l') guessed.push_back("l");
+        else if (letter == 'r') guessed.push_back("r");
+        else if (letter == 's') guessed.push_back("s");
+        else if (letter == 'f') guessed.push_back("f");
+        else if (letter == 'v') guessed.push_back("v");
+        else if (letter == 'z') guessed.push_back("z");
+        else if (letter == 'j') guessed.push_back("jh");
+        else if (letter == 'g') guessed.push_back("g");
+        else if (letter == 'w') guessed.push_back("w");
+        else guessed.push_back("ah");
+        ++index;
+    }
+
+    if (guessed.empty())
+    {
+        return juce::Result::fail("No pronunciation for dictionary key '" + text + "'.");
+    }
+
+    bool valid = true;
+    for (const auto& symbol : guessed)
+    {
+        if (!symbols.contains(symbol))
+        {
+            valid = false;
+            break;
+        }
+    }
+    if (!valid)
+    {
+        return juce::Result::fail("No pronunciation for dictionary key '" + text + "'.");
+    }
+
+    output = std::move(guessed);
     return juce::Result::ok();
 }
 
