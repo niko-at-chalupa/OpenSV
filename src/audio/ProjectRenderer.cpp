@@ -116,6 +116,22 @@ std::vector<std::vector<std::string>> splitEnglishSyllables(std::span<const std:
     return syllables;
 }
 
+void deferTrailingEnglishCoda(std::vector<std::string>& phonemes, std::vector<std::string>& deferredCoda)
+{
+    const auto vowel = std::find_if(phonemes.rbegin(), phonemes.rend(), [](const std::string& symbol)
+                                    { return isEnglishVowelPhoneme(symbol); });
+    if (vowel == phonemes.rend())
+    {
+        return;
+    }
+    const auto codaBegin = vowel.base();
+    if (codaBegin != phonemes.end())
+    {
+        deferredCoda.assign(codaBegin, phonemes.end());
+        phonemes.erase(codaBegin, phonemes.end());
+    }
+}
+
 void mergeContinuationPhones(std::span<const synthesis::PhonemeDuration> durations, std::span<const synthesis::TimingSyllable> syllables, std::vector<synthesis::TimedPhoneme>& phonemes)
 {
     if (durations.size() != phonemes.size())
@@ -1028,6 +1044,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 std::string continuationLanguage = track.voice.language;
                 std::string wordSyllableLanguage = track.voice.language;
                 std::vector<std::vector<std::string>> pendingEnglishSyllables;
+                std::vector<std::string> pendingLegatoCoda;
                 std::size_t nextEnglishSyllable = 0;
                 double cursorSeconds = startSeconds;
                 std::size_t phonemeCount = 0;
@@ -1043,6 +1060,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         continuationPhoneme.clear();
                         continuationLanguage = track.voice.language;
+                        pendingLegatoCoda.clear();
                         syllables.push_back({track.voice.language, {"sil"}, gapSeconds, note.pitch, false});
                         synthesis::PitchNote silence;
                         silence.syllable = syllables.back();
@@ -1057,6 +1075,9 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     std::string phonemeLanguage = track.voice.language;
                     const bool isSyllableBreak = note.note->lyrics == "+";
                     const bool isLegato = note.note->lyrics == "-";
+                    const bool nextIsLegato = noteIndex + 1 < notes.size()
+                                              && notes[noteIndex + 1].note->lyrics == "-"
+                                              && std::abs(notes[noteIndex + 1].startSeconds - note.endSeconds) <= 0.000001;
                     if (isLegato)
                     {
                         if (continuationPhoneme.empty() && note.note->phonemes.empty())
@@ -1118,6 +1139,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         return trackError(track, noteContext(note) + result.getErrorMessage());
                     }
+                    const bool automaticEnglishPhones = phonemeLanguage == "english" && note.note->phonemes.empty() && !note.note->lyrics.empty() && note.note->lyrics.front() != '.';
                     if (!isSyllableBreak && !isLegato)
                     {
                         wordSyllableLanguage = phonemeLanguage;
@@ -1148,6 +1170,19 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                                 }
                             }
                         }
+                    }
+                    if (!isLegato)
+                    {
+                        pendingLegatoCoda.clear();
+                        if (automaticEnglishPhones && nextIsLegato)
+                        {
+                            deferTrailingEnglishCoda(phonemes, pendingLegatoCoda);
+                        }
+                    }
+                    else if (!nextIsLegato && !pendingLegatoCoda.empty())
+                    {
+                        phonemes.insert(phonemes.end(), pendingLegatoCoda.begin(), pendingLegatoCoda.end());
+                        pendingLegatoCoda.clear();
                     }
                     continuationLanguage = phonemeLanguage;
                     if (!phonemes.empty())
