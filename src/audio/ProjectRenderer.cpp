@@ -86,6 +86,36 @@ bool isEnglishVowelPhoneme(std::string_view symbol)
     return std::find(vowels.begin(), vowels.end(), symbol) != vowels.end();
 }
 
+std::vector<std::vector<std::string>> splitEnglishSyllables(std::span<const std::string> phonemes)
+{
+    std::vector<std::size_t> nuclei;
+    for (std::size_t index = 0; index < phonemes.size(); ++index)
+    {
+        if (isEnglishVowelPhoneme(phonemes[index]))
+        {
+            nuclei.push_back(index);
+        }
+    }
+    if (nuclei.size() < 2)
+    {
+        return {std::vector<std::string>(phonemes.begin(), phonemes.end())};
+    }
+
+    std::vector<std::vector<std::string>> syllables;
+    syllables.reserve(nuclei.size());
+    std::size_t syllableStart = 0;
+    for (std::size_t index = 0; index + 1 < nuclei.size(); ++index)
+    {
+        const auto nextNucleus = nuclei[index + 1];
+        const auto consonantCount = nextNucleus - nuclei[index] - 1;
+        const auto nextSyllableStart = consonantCount == 0 ? nextNucleus : nextNucleus - 1;
+        syllables.emplace_back(phonemes.begin() + static_cast<std::ptrdiff_t>(syllableStart), phonemes.begin() + static_cast<std::ptrdiff_t>(nextSyllableStart));
+        syllableStart = nextSyllableStart;
+    }
+    syllables.emplace_back(phonemes.begin() + static_cast<std::ptrdiff_t>(syllableStart), phonemes.end());
+    return syllables;
+}
+
 void mergeContinuationPhones(std::span<const synthesis::PhonemeDuration> durations, std::span<const synthesis::TimingSyllable> syllables, std::vector<synthesis::TimedPhoneme>& phonemes)
 {
     if (durations.size() != phonemes.size())
@@ -996,6 +1026,8 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 std::vector<synthesis::PitchNote> pitchNotes;
                 std::string continuationPhoneme;
                 std::string continuationLanguage = track.voice.language;
+                std::vector<std::vector<std::string>> pendingEnglishSyllables;
+                std::size_t nextEnglishSyllable = 0;
                 double cursorSeconds = startSeconds;
                 std::size_t phonemeCount = 0;
                 for (std::size_t noteIndex = 0; noteIndex < notes.size(); ++noteIndex)
@@ -1010,6 +1042,8 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         continuationPhoneme.clear();
                         continuationLanguage = track.voice.language;
+                        pendingEnglishSyllables.clear();
+                        nextEnglishSyllable = 0;
                         syllables.push_back({track.voice.language, {"sil"}, gapSeconds, note.pitch, false});
                         synthesis::PitchNote silence;
                         silence.syllable = syllables.back();
@@ -1022,12 +1056,13 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     }
                     std::vector<std::string> phonemes;
                     std::string phonemeLanguage = track.voice.language;
-                    const bool isContinuation = note.note->lyrics == "+" || note.note->lyrics == "-";
-                    if (isContinuation)
+                    const bool isSyllableBreak = note.note->lyrics == "+";
+                    const bool isLegato = note.note->lyrics == "-";
+                    if (isLegato)
                     {
                         if (continuationPhoneme.empty() && note.note->phonemes.empty())
                         {
-                            return trackError(track, noteContext(note) + "a continuation lyric (+/-) must immediately follow a note with a resolved syllable.");
+                            return trackError(track, noteContext(note) + "a legato lyric (-) must immediately follow a note with a resolved syllable.");
                         }
                         if (!note.note->phonemes.empty())
                         {
@@ -1056,27 +1091,79 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                             phonemeLanguage = continuationLanguage;
                         }
                     }
+                    else if (isSyllableBreak)
+                    {
+                        if (!note.note->phonemes.empty())
+                        {
+                            if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme, phonemeLanguage, continuationLanguage == "english"); result.failed())
+                            {
+                                return trackError(track, noteContext(note) + result.getErrorMessage());
+                            }
+                            if (nextEnglishSyllable < pendingEnglishSyllables.size())
+                            {
+                                ++nextEnglishSyllable;
+                            }
+                        }
+                        else
+                        {
+                            if (nextEnglishSyllable >= pendingEnglishSyllables.size())
+                            {
+                                return trackError(track, noteContext(note) + "'+' advances to the next syllable, but no remaining syllable is available; enter its phonemes explicitly if needed.");
+                            }
+                            phonemes = pendingEnglishSyllables[nextEnglishSyllable++];
+                            phonemeLanguage = continuationLanguage;
+                        }
+                    }
                     else if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme, phonemeLanguage, continuationLanguage == "english"); result.failed())
                     {
                         return trackError(track, noteContext(note) + result.getErrorMessage());
                     }
+                    if (!isSyllableBreak && !isLegato)
+                    {
+                        pendingEnglishSyllables.clear();
+                        nextEnglishSyllable = 0;
+                        if (phonemeLanguage == "english" && note.note->phonemes.empty())
+                        {
+                            pendingEnglishSyllables = splitEnglishSyllables(phonemes);
+                            if (pendingEnglishSyllables.size() > 1)
+                            {
+                                phonemes = std::move(pendingEnglishSyllables.front());
+                                nextEnglishSyllable = 1;
+                            }
+                            else
+                            {
+                                pendingEnglishSyllables.clear();
+                            }
+                        }
+                    }
                     continuationLanguage = phonemeLanguage;
+                    if (!phonemes.empty())
+                    {
+                        const auto vowel = std::find_if(phonemes.rbegin(), phonemes.rend(), [](const std::string& symbol)
+                                                        { return isEnglishVowelPhoneme(symbol); });
+                        if (vowel != phonemes.rend() && phonemeLanguage == "english")
+                        {
+                            continuationPhoneme = *vowel;
+                        }
+                    }
                     if (phonemes.size() == 1 && (phonemes.front() == "sil" || phonemes.front() == "br"))
                     {
                         continuationPhoneme.clear();
                         continuationLanguage = track.voice.language;
+                        pendingEnglishSyllables.clear();
+                        nextEnglishSyllable = 0;
                     }
                     phonemeCount += phonemes.size();
                     if (phonemeCount >= maximumPhrasePhonemes)
                     {
                         return trackError(track, "The phrase exceeds the 4096-phoneme inference limit.");
                     }
-                    syllables.push_back({phonemeLanguage, std::move(phonemes), note.endSeconds - note.startSeconds, note.pitch, isContinuation});
+                    syllables.push_back({phonemeLanguage, std::move(phonemes), note.endSeconds - note.startSeconds, note.pitch, isLegato});
                     synthesis::PitchNote pitchNote;
                     pitchNote.syllable = syllables.back();
                     pitchNote.isSilence = pitchNote.syllable.phonemes.size() == 1 && pitchNote.syllable.phonemes.front() == "sil";
                     pitchNote.isBreath = pitchNote.syllable.phonemes.size() == 1 && pitchNote.syllable.phonemes.front() == "br";
-                    pitchNote.isContinuation = isContinuation;
+                    pitchNote.isContinuation = isLegato;
                     pitchNote.isRap = note.note->musicalType == "rap";
                     if (note.note->accent.size() == 1 && note.note->accent.front() >= '1' && note.note->accent.front() <= '5')
                     {
