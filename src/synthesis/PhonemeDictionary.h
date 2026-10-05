@@ -34,6 +34,7 @@ public:
     // Both query methods leave output intact on failure and reject empty input.
     [[nodiscard]] juce::Result lookup(std::string_view lyrics, std::vector<std::string>& output) const;
     [[nodiscard]] juce::Result parseExplicitPhonemes(std::string_view text, std::vector<std::string>& output) const;
+    [[nodiscard]] bool hasEntry(std::string_view key) const;
 
     [[nodiscard]] bool isLoaded() const;
     [[nodiscard]] const std::vector<PhonemeDefinition>& getPhonemes() const;

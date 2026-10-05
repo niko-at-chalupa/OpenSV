@@ -77,6 +77,35 @@ juce::StringArray splitFields(const juce::String& line)
     return fields;
 }
 
+std::string normalizeEnglishKey(std::string key)
+{
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char character)
+                   { return static_cast<char>(std::tolower(character)); });
+    if (const auto variant = key.rfind('('); variant != std::string::npos && key.back() == ')'
+        && variant + 2 < key.size()
+        && std::all_of(key.begin() + static_cast<std::ptrdiff_t>(variant + 1), key.end() - 1, [](unsigned char character)
+                       { return std::isdigit(character) != 0; }))
+    {
+        key.erase(variant);
+    }
+    return key;
+}
+
+void normalizeEnglishPhone(std::string& symbol)
+{
+    if (!symbol.empty() && symbol.back() >= '0' && symbol.back() <= '2')
+    {
+        symbol.pop_back();
+    }
+    static const std::unordered_map<std::string, std::string> cmuAliases{
+        {"ax", "ah"}, {"ax-h", "ah"}, {"axr", "er"}, {"el", "l"}, {"em", "m"}, {"en", "n"},
+        {"eng", "ng"}, {"hv", "hh"}, {"ix", "ih"}, {"nx", "n"}, {"ux", "uw"}, {"wh", "w"}};
+    if (const auto alias = cmuAliases.find(symbol); alias != cmuAliases.end())
+    {
+        symbol = alias->second;
+    }
+}
+
 juce::Result lineError(const juce::File& file, int line, const juce::String& message)
 {
     return juce::Result::fail(file.getFullPathName() + ":" + juce::String(line) + ": " + message);
@@ -147,6 +176,7 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
 
     PhonemeDictionary loaded;
     loaded.isEnglishArpabet = phonesFile.getFileName() == "english-arpabet-phones.txt";
+    const bool isCmuDictionary = loaded.isEnglishArpabet && dictionaryFile.getFileName() == "cmudict-07b.txt";
     const auto phoneLines = juce::StringArray::fromLines(phonesText);
     for (int line = 0; line < phoneLines.size(); ++line)
     {
@@ -174,6 +204,10 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
     const auto dictionaryLines = juce::StringArray::fromLines(dictionaryText);
     for (int line = 0; line < dictionaryLines.size(); ++line)
     {
+        if (isCmuDictionary && dictionaryLines[line].trimStart().startsWith(";;;"))
+        {
+            continue;
+        }
         const auto fields = splitFields(dictionaryLines[line]);
         if (fields.isEmpty())
         {
@@ -183,21 +217,40 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
         {
             return lineError(dictionaryFile, line + 1, "Expected a dictionary key followed by one or more phonemes.");
         }
-        const auto key = fields[0].toStdString();
+        const auto sourceKey = fields[0].toStdString();
+        const auto key = loaded.isEnglishArpabet ? normalizeEnglishKey(sourceKey) : sourceKey;
         if (loaded.entries.contains(key))
         {
-            return lineError(dictionaryFile, line + 1, "Duplicate dictionary key '" + fields[0] + "'; alternative pronunciations require a confirmed format.");
+            if (isCmuDictionary || sourceKey != key)
+            {
+                continue;
+            }
+            return lineError(dictionaryFile, line + 1, "Duplicate dictionary key '" + fields[0] + "'.");
         }
         std::vector<std::string> pronunciation;
         pronunciation.reserve(static_cast<std::size_t>(fields.size() - 1));
+        bool supportedPronunciation = true;
         for (int field = 1; field < fields.size(); ++field)
         {
-            const auto symbol = fields[field].toStdString();
+            auto symbol = fields[field].toStdString();
+            if (isCmuDictionary)
+            {
+                normalizeEnglishPhone(symbol);
+            }
             if (!loaded.symbols.contains(symbol))
             {
+                if (isCmuDictionary)
+                {
+                    supportedPronunciation = false;
+                    break;
+                }
                 return lineError(dictionaryFile, line + 1, "Undefined phoneme '" + fields[field] + "' in entry '" + fields[0] + "'.");
             }
             pronunciation.push_back(symbol);
+        }
+        if (!supportedPronunciation)
+        {
+            continue;
         }
         loaded.entries.emplace(key, std::move(pronunciation));
     }
@@ -590,6 +643,31 @@ juce::Result PhonemeDictionary::parseExplicitPhonemes(std::string_view text, std
     }
     output = std::move(parsed);
     return juce::Result::ok();
+}
+
+bool PhonemeDictionary::hasEntry(std::string_view key) const
+{
+    if (key.empty())
+    {
+        return false;
+    }
+    std::string candidate(key);
+    if (isEnglishArpabet)
+    {
+        candidate = normalizeEnglishKey(std::move(candidate));
+    }
+    else
+    {
+        std::transform(candidate.begin(), candidate.end(), candidate.begin(), [](unsigned char character)
+                       { return static_cast<char>(std::tolower(character)); });
+    }
+    if (entries.contains(candidate))
+    {
+        return true;
+    }
+    candidate.erase(std::remove_if(candidate.begin(), candidate.end(), [](unsigned char character)
+                                   { return !std::isalnum(character); }), candidate.end());
+    return !candidate.empty() && entries.contains(candidate);
 }
 
 bool PhonemeDictionary::isLoaded() const

@@ -87,7 +87,7 @@ private:
 
     [[nodiscard]] static juce::Result readFileStamp(const juce::File& file, FileStamp& stamp);
     [[nodiscard]] juce::Result findVoice(const FileStamp& source, synthesis::VoiceSynthesizer*& synthesizer);
-    [[nodiscard]] juce::Result resolvePhonemes(const VoiceSettings& settings, const Note& note, std::vector<std::string>& phonemes, std::string& continuationPhoneme);
+    [[nodiscard]] juce::Result resolvePhonemes(const VoiceSettings& settings, const Note& note, std::vector<std::string>& phonemes, std::string& continuationPhoneme, std::string& phonemeLanguage, bool preferEnglishContext);
     [[nodiscard]] static bool matchesTiming(const CachedPhrase& cached, const FileStamp& voiceSource, const std::vector<synthesis::TimingSyllable>& syllables);
     [[nodiscard]] static std::size_t phraseBytes(const CachedPhrase& phrase);
     void retainPhrase(CachedPhrase phrase);

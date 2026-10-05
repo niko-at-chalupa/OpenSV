@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -527,8 +528,9 @@ juce::Result ProjectRenderer::findVoice(const FileStamp& source, synthesis::Voic
     return juce::Result::ok();
 }
 
-juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, const Note& note, std::vector<std::string>& phonemes, std::string& continuationPhoneme)
+juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, const Note& note, std::vector<std::string>& phonemes, std::string& continuationPhoneme, std::string& phonemeLanguage, bool preferEnglishContext)
 {
+    phonemeLanguage = settings.language;
     const auto selectContinuationPhoneme = [&phonemes, &continuationPhoneme](const synthesis::PhonemeDictionary& dictionary)
     {
         continuationPhoneme = phonemes.empty() ? std::string{} : phonemes.back();
@@ -580,6 +582,75 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
         }
         return juce::Result::ok();
     }
+    const bool latinWord = !note.lyrics.empty() && std::all_of(note.lyrics.begin(), note.lyrics.end(), [](unsigned char character)
+                                                               { return std::isalpha(character) != 0 || character == '\'' || character == '-'; });
+    const auto loadEnglishDictionary = [&]() -> juce::Result
+    {
+        const juce::File directory(juce::String::fromUTF8(settings.dictionaryDirectory.c_str()));
+        const auto phonesFile = directory.getChildFile("english-arpabet-phones.txt");
+        auto dictionaryFile = directory.getChildFile("cmudict-07b.txt");
+        if (!dictionaryFile.existsAsFile())
+        {
+            dictionaryFile = directory.getChildFile("english-arpabet-dict.txt");
+        }
+        if (!phonesFile.existsAsFile() || !dictionaryFile.existsAsFile())
+        {
+            return juce::Result::fail("English pronunciation dictionary files are unavailable.");
+        }
+        FileStamp phonesSource;
+        FileStamp dictionarySource;
+        if (const auto result = readFileStamp(phonesFile, phonesSource); result.failed())
+        {
+            return result;
+        }
+        if (const auto result = readFileStamp(dictionaryFile, dictionarySource); result.failed())
+        {
+            return result;
+        }
+        const auto found = std::find_if(dictionaries.begin(), dictionaries.end(), [&phonesSource, &dictionarySource](const CachedDictionary& entry)
+                                        { return entry.phonesSource == phonesSource && entry.dictionarySource == dictionarySource; });
+        if (found != dictionaries.end())
+        {
+            std::rotate(found, std::next(found), dictionaries.end());
+            return juce::Result::ok();
+        }
+        synthesis::PhonemeDictionary dictionary;
+        if (const auto result = dictionary.load(phonesSource.file, dictionarySource.file); result.failed())
+        {
+            return result;
+        }
+        if (dictionaries.size() == 4)
+        {
+            dictionaries.erase(dictionaries.begin());
+        }
+        dictionaries.push_back({phonesSource, dictionarySource, {}, {}, {}, {}, std::move(dictionary)});
+        return juce::Result::ok();
+    };
+    const auto resolveAsEnglish = [&](const synthesis::PhonemeDictionary& localDictionary)
+    {
+        if (settings.language != "japanese" || !latinWord || settings.dictionaryDirectory.empty())
+        {
+            return false;
+        }
+        const bool localHasEntry = localDictionary.hasEntry(note.lyrics);
+        if (loadEnglishDictionary().failed())
+        {
+            return false;
+        }
+        auto& englishDictionary = dictionaries.back().dictionary;
+        const bool startsUppercase = !note.lyrics.empty() && std::isupper(static_cast<unsigned char>(note.lyrics.front())) != 0;
+        if (!englishDictionary.hasEntry(note.lyrics) || (!preferEnglishContext && !startsUppercase && localHasEntry))
+        {
+            return false;
+        }
+        if (englishDictionary.lookup(note.lyrics, phonemes).failed())
+        {
+            return false;
+        }
+        phonemeLanguage = "english";
+        selectContinuationPhoneme(englishDictionary);
+        return true;
+    };
     const auto stem = dictionaryStem(settings.language);
     if (stem.isEmpty())
     {
@@ -591,9 +662,13 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
     }
     const juce::File directory(juce::String::fromUTF8(settings.dictionaryDirectory.c_str()));
     auto file = directory.getChildFile(stem + "-dict.txt");
-    if (settings.language == "english" && !file.existsAsFile())
+    if (settings.language == "english")
     {
-        file = directory.getChildFile("cmudict-07b.txt");
+        const auto cmuDictionary = directory.getChildFile("cmudict-07b.txt");
+        if (cmuDictionary.existsAsFile())
+        {
+            file = cmuDictionary;
+        }
     }
     FileStamp phonesSource;
     FileStamp dictionarySource;
@@ -640,6 +715,16 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
     if (found != dictionaries.end())
     {
         std::rotate(found, std::next(found), dictionaries.end());
+        if (resolveAsEnglish(dictionaries.back().dictionary))
+        {
+            return juce::Result::ok();
+        }
+        const auto local = std::find_if(dictionaries.begin(), dictionaries.end(), [&phonesSource, &dictionarySource, &readingsSource, &hiraganaSource, &katakanaSource, &smallKanaSource](const CachedDictionary& entry)
+                                        { return entry.phonesSource == phonesSource && entry.dictionarySource == dictionarySource && entry.readingsSource == readingsSource && entry.hiraganaSource == hiraganaSource && entry.katakanaSource == katakanaSource && entry.smallKanaSource == smallKanaSource; });
+        if (local != dictionaries.end())
+        {
+            std::rotate(local, std::next(local), dictionaries.end());
+        }
         const auto result = dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
         if (result.wasOk())
         {
@@ -660,10 +745,31 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
         dictionaries.erase(dictionaries.begin());
     }
     dictionaries.push_back({phonesSource, dictionarySource, readingsSource, hiraganaSource, katakanaSource, smallKanaSource, std::move(dictionary)});
+    if (resolveAsEnglish(dictionaries.back().dictionary))
+    {
+        return juce::Result::ok();
+    }
+    const auto local = std::find_if(dictionaries.begin(), dictionaries.end(), [&phonesSource, &dictionarySource, &readingsSource, &hiraganaSource, &katakanaSource, &smallKanaSource](const CachedDictionary& entry)
+                                    { return entry.phonesSource == phonesSource && entry.dictionarySource == dictionarySource && entry.readingsSource == readingsSource && entry.hiraganaSource == hiraganaSource && entry.katakanaSource == katakanaSource && entry.smallKanaSource == smallKanaSource; });
+    if (local != dictionaries.end())
+    {
+        std::rotate(local, std::next(local), dictionaries.end());
+    }
     const auto result = dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
     if (result.wasOk())
     {
         selectContinuationPhoneme(dictionaries.back().dictionary);
+        return result;
+    }
+    if (settings.language == "japanese" && latinWord && loadEnglishDictionary().wasOk())
+    {
+        const auto english = dictionaries.back().dictionary.lookup(note.lyrics, phonemes);
+        if (english.wasOk())
+        {
+            phonemeLanguage = "english";
+            selectContinuationPhoneme(dictionaries.back().dictionary);
+            return english;
+        }
     }
     return result;
 }
@@ -889,6 +995,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 std::vector<synthesis::TimingSyllable> syllables;
                 std::vector<synthesis::PitchNote> pitchNotes;
                 std::string continuationPhoneme;
+                std::string continuationLanguage = track.voice.language;
                 double cursorSeconds = startSeconds;
                 std::size_t phonemeCount = 0;
                 for (std::size_t noteIndex = 0; noteIndex < notes.size(); ++noteIndex)
@@ -913,6 +1020,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                         ++phonemeCount;
                     }
                     std::vector<std::string> phonemes;
+                    std::string phonemeLanguage = track.voice.language;
                     const bool isContinuation = note.note->lyrics == "+" || note.note->lyrics == "-";
                     if (isContinuation)
                     {
@@ -921,21 +1029,24 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                             return trackError(track, noteContext(note) + "a continuation lyric (+/-) must immediately follow a note with a resolved syllable.");
                         }
                         phonemes.push_back(continuationPhoneme);
+                        phonemeLanguage = continuationLanguage;
                     }
-                    else if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme); result.failed())
+                    else if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme, phonemeLanguage, continuationLanguage == "english"); result.failed())
                     {
                         return trackError(track, noteContext(note) + result.getErrorMessage());
                     }
+                    continuationLanguage = phonemeLanguage;
                     if (phonemes.size() == 1 && (phonemes.front() == "sil" || phonemes.front() == "br"))
                     {
                         continuationPhoneme.clear();
+                        continuationLanguage = track.voice.language;
                     }
                     phonemeCount += phonemes.size();
                     if (phonemeCount >= maximumPhrasePhonemes)
                     {
                         return trackError(track, "The phrase exceeds the 4096-phoneme inference limit.");
                     }
-                    syllables.push_back({track.voice.language, std::move(phonemes), note.endSeconds - note.startSeconds, note.pitch, isContinuation});
+                    syllables.push_back({phonemeLanguage, std::move(phonemes), note.endSeconds - note.startSeconds, note.pitch, isContinuation});
                     synthesis::PitchNote pitchNote;
                     pitchNote.syllable = syllables.back();
                     pitchNote.isSilence = pitchNote.syllable.phonemes.size() == 1 && pitchNote.syllable.phonemes.front() == "sil";
