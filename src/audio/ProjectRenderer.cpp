@@ -421,6 +421,10 @@ juce::String dictionaryStem(const std::string& language)
     {
         return "mandarin-xsampa";
     }
+    if (language == "english")
+    {
+        return "english-arpabet";
+    }
     if (language == "cantonese")
     {
         return "cantonese-xsampa";
@@ -505,7 +509,11 @@ juce::Result ProjectRenderer::resolvePhonemes(const VoiceSettings& settings, con
         return juce::Result::fail("Select the clf-data pronunciation dictionary directory or enter explicit phonemes.");
     }
     const juce::File directory(juce::String::fromUTF8(settings.dictionaryDirectory.c_str()));
-    const auto file = directory.getChildFile(stem + "-dict.txt");
+    auto file = directory.getChildFile(stem + "-dict.txt");
+    if (settings.language == "english" && !file.existsAsFile())
+    {
+        file = directory.getChildFile("cmudict-07b.txt");
+    }
     FileStamp phonesSource;
     FileStamp dictionarySource;
     if (const auto result = readFileStamp(directory.getChildFile(stem + "-phones.txt"), phonesSource); result.failed())
