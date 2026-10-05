@@ -50,6 +50,8 @@ private:
         FileStamp phonesSource;
         FileStamp dictionarySource;
         std::optional<FileStamp> readingsSource;
+        std::optional<FileStamp> hiraganaSource;
+        std::optional<FileStamp> katakanaSource;
         synthesis::PhonemeDictionary dictionary;
     };
 

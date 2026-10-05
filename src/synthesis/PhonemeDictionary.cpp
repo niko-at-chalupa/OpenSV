@@ -209,6 +209,51 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
     return juce::Result::ok();
 }
 
+juce::Result PhonemeDictionary::loadJapanese(const juce::File& phonesFile, const juce::File& dictionaryFile, const juce::File& hiraganaFile, const juce::File& katakanaFile)
+{
+    PhonemeDictionary loaded;
+    if (const auto result = loaded.load(phonesFile, dictionaryFile); result.failed())
+    {
+        return result;
+    }
+
+    for (const auto& mappingFile : {hiraganaFile, katakanaFile})
+    {
+        juce::String mappingText;
+        if (const auto result = readText(mappingFile, mappingText); result.failed())
+        {
+            return result;
+        }
+        const auto lines = juce::StringArray::fromLines(mappingText);
+        for (int line = 0; line < lines.size(); ++line)
+        {
+            const auto fields = splitFields(lines[line]);
+            if (fields.isEmpty())
+            {
+                continue;
+            }
+            if (fields.size() != 2)
+            {
+                return lineError(mappingFile, line + 1, "Expected exactly two fields: kana and romaji.");
+            }
+            const auto kana = fields[0].toStdString();
+            const auto romaji = fields[1].toStdString();
+            const auto [found, inserted] = loaded.kanaToRomaji.emplace(kana, romaji);
+            if (!inserted && found->second != romaji)
+            {
+                return lineError(mappingFile, line + 1, "Conflicting romaji for kana '" + fields[0] + "'.");
+            }
+        }
+    }
+    if (loaded.kanaToRomaji.empty())
+    {
+        return juce::Result::fail("Japanese kana conversion dictionaries contain no entries.");
+    }
+    loaded.isJapanese = true;
+    *this = std::move(loaded);
+    return juce::Result::ok();
+}
+
 juce::Result PhonemeDictionary::loadMandarin(const juce::File& phonesFile, const juce::File& dictionaryFile, const juce::File& cedictFile)
 {
     PhonemeDictionary loaded;
@@ -326,8 +371,32 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
         output = std::move(pronunciation);
         return juce::Result::ok();
     }
+    std::string key(lyrics);
+    if (isJapanese)
+    {
+        std::string romanized;
+        bool allKana = true;
+        for (int index = 0; index < text.length(); ++index)
+        {
+            const auto kana = juce::String::charToString(text[index]).toStdString();
+            const auto foundKana = kanaToRomaji.find(kana);
+            if (foundKana == kanaToRomaji.end())
+            {
+                allKana = false;
+                break;
+            }
+            romanized += foundKana->second;
+        }
+        if (allKana)
+        {
+            key = std::move(romanized);
+        }
+    }
     const auto normalized = isMandarin ? normalizePinyin(text) : juce::String{};
-    const auto key = normalized.isEmpty() ? std::string(lyrics) : normalized.toStdString();
+    if (!normalized.isEmpty())
+    {
+        key = normalized.toStdString();
+    }
     const auto found = entries.find(key);
     if (found != entries.end())
     {

@@ -25,6 +25,7 @@ class PhonemeDictionary final
 public:
     // Failure leaves the previously loaded dictionary intact.
     [[nodiscard]] juce::Result load(const juce::File& phonesFile, const juce::File& dictionaryFile);
+    [[nodiscard]] juce::Result loadJapanese(const juce::File& phonesFile, const juce::File& dictionaryFile, const juce::File& hiraganaFile, const juce::File& katakanaFile);
     [[nodiscard]] juce::Result loadMandarin(const juce::File& phonesFile, const juce::File& dictionaryFile, const juce::File& cedictFile);
 
     // Generic dictionaries try exact and ASCII case-insensitive keys. Uppercase English single
@@ -42,7 +43,9 @@ private:
     std::vector<PhonemeDefinition> phonemes;
     std::unordered_set<std::string> symbols;
     std::unordered_map<std::string, std::vector<std::string>> entries;
+    std::unordered_map<std::string, std::string> kanaToRomaji;
     bool isMandarin = false;
+    bool isJapanese = false;
     bool isEnglishArpabet = false;
 };
 } // namespace sv::synthesis
