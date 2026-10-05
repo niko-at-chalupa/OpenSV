@@ -1009,6 +1009,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     if (gapSeconds > 0.0)
                     {
                         continuationPhoneme.clear();
+                        continuationLanguage = track.voice.language;
                         syllables.push_back({track.voice.language, {"sil"}, gapSeconds, note.pitch, false});
                         synthesis::PitchNote silence;
                         silence.syllable = syllables.back();
@@ -1024,12 +1025,36 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     const bool isContinuation = note.note->lyrics == "+" || note.note->lyrics == "-";
                     if (isContinuation)
                     {
-                        if (continuationPhoneme.empty())
+                        if (continuationPhoneme.empty() && note.note->phonemes.empty())
                         {
                             return trackError(track, noteContext(note) + "a continuation lyric (+/-) must immediately follow a note with a resolved syllable.");
                         }
-                        phonemes.push_back(continuationPhoneme);
-                        phonemeLanguage = continuationLanguage;
+                        if (!note.note->phonemes.empty())
+                        {
+                            if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme, phonemeLanguage, continuationLanguage == "english"); result.failed())
+                            {
+                                return trackError(track, noteContext(note) + result.getErrorMessage());
+                            }
+                            phonemeLanguage = continuationLanguage;
+                            if (phonemeLanguage == "english")
+                            {
+                                const auto vowel = std::find_if(phonemes.rbegin(), phonemes.rend(), [](const std::string& symbol)
+                                                                { return isEnglishVowelPhoneme(symbol); });
+                                if (vowel != phonemes.rend())
+                                {
+                                    continuationPhoneme = *vowel;
+                                }
+                            }
+                            else if (!phonemes.empty())
+                            {
+                                continuationPhoneme = phonemes.back();
+                            }
+                        }
+                        else
+                        {
+                            phonemes.push_back(continuationPhoneme);
+                            phonemeLanguage = continuationLanguage;
+                        }
                     }
                     else if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme, phonemeLanguage, continuationLanguage == "english"); result.failed())
                     {
