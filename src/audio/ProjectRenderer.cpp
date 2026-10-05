@@ -1026,6 +1026,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 std::vector<synthesis::PitchNote> pitchNotes;
                 std::string continuationPhoneme;
                 std::string continuationLanguage = track.voice.language;
+                std::string wordSyllableLanguage = track.voice.language;
                 std::vector<std::vector<std::string>> pendingEnglishSyllables;
                 std::size_t nextEnglishSyllable = 0;
                 double cursorSeconds = startSeconds;
@@ -1042,15 +1043,13 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         continuationPhoneme.clear();
                         continuationLanguage = track.voice.language;
-                        pendingEnglishSyllables.clear();
-                        nextEnglishSyllable = 0;
                         syllables.push_back({track.voice.language, {"sil"}, gapSeconds, note.pitch, false});
                         synthesis::PitchNote silence;
                         silence.syllable = syllables.back();
                         silence.isSilence = true;
                         if (noteIndex != 0)
                         {
-                            pitchNotes.push_back(std::move(silence));
+                            phonemeLanguage = wordSyllableLanguage;
                         }
                         ++phonemeCount;
                     }
@@ -1099,6 +1098,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                             {
                                 return trackError(track, noteContext(note) + result.getErrorMessage());
                             }
+                            phonemeLanguage = wordSyllableLanguage;
                             if (nextEnglishSyllable < pendingEnglishSyllables.size())
                             {
                                 ++nextEnglishSyllable;
@@ -1111,7 +1111,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                                 return trackError(track, noteContext(note) + "'+' advances to the next syllable, but no remaining syllable is available; enter its phonemes explicitly if needed.");
                             }
                             phonemes = pendingEnglishSyllables[nextEnglishSyllable++];
-                            phonemeLanguage = continuationLanguage;
+                            phonemeLanguage = wordSyllableLanguage;
                         }
                     }
                     else if (const auto result = resolvePhonemes(track.voice, *note.note, phonemes, continuationPhoneme, phonemeLanguage, continuationLanguage == "english"); result.failed())
@@ -1120,6 +1120,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     }
                     if (!isSyllableBreak && !isLegato)
                     {
+                        wordSyllableLanguage = phonemeLanguage;
                         pendingEnglishSyllables.clear();
                         nextEnglishSyllable = 0;
                         if (phonemeLanguage == "english" && !note.note->lyrics.empty() && note.note->lyrics.front() != '.')
@@ -1162,6 +1163,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     {
                         continuationPhoneme.clear();
                         continuationLanguage = track.voice.language;
+                        wordSyllableLanguage = track.voice.language;
                         pendingEnglishSyllables.clear();
                         nextEnglishSyllable = 0;
                     }
