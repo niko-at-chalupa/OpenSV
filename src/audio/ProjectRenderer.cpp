@@ -432,7 +432,12 @@ juce::Result buildPitch(const Project& project, std::span<const RenderNote> note
             const auto right = std::min(left + 1, residual.size() - 1);
             automaticDelta = std::lerp(residual[left], residual[right], modelFrame - static_cast<double>(left));
         }
-        const double cents = sampleParameterCurve(note.group->pitchDelta, position);
+        // Keep the reference's imported system contour as well as the group's
+        // editable pitch correction. The system curve can contain detailed
+        // note-level motion (including fast vibrato) that is not reproduced by
+        // the newly generated pitch prediction.
+        const double cents = sampleParameterCurve(note.reference->systemPitchDelta, position, 0.0)
+                   + sampleParameterCurve(note.group->pitchDelta, position, 0.0);
         const double noteProgress = std::clamp((seconds - note.startSeconds) / (note.endSeconds - note.startSeconds), 0.0, 1.0);
         const double rapIntonation = note.note->musicalType == "rap" ? editorNotes[noteIndex].rapIntonation * (noteProgress - 0.5) : 0.0;
         const double pitch = transitions[frame] + mask[frame] * automaticDelta + envelope[frame] * vibrato[frame] + cents / 100.0 + rapIntonation;
