@@ -256,12 +256,12 @@ juce::Result prepareTrack(const Project& project, RenderTrack& prepared)
     return juce::Result::ok();
 }
 
-std::shared_ptr<const PhraseVisualization> makeVisualization(const synthesis::NeuralVocoderOutput& rendered, float frameInterval, std::span<const float> logF0)
+std::shared_ptr<const PhraseVisualization> makeVisualization(std::span<const float> samples, double sampleRate, float frameInterval, std::span<const float> logF0)
 {
     auto data = std::make_shared<PhraseVisualization>();
-    data->sampleRate = rendered.sampleRate;
+    data->sampleRate = sampleRate;
     data->frameIntervalSeconds = static_cast<double>(frameInterval);
-    data->sampleCount = rendered.samples.size();
+    data->sampleCount = samples.size();
     data->midiPitch.reserve(logF0.size());
     for (const float logarithmicPitch : logF0)
     {
@@ -270,11 +270,11 @@ std::shared_ptr<const PhraseVisualization> makeVisualization(const synthesis::Ne
         data->midiPitch.push_back(static_cast<float>(69.0 + 12.0 * (static_cast<double>(logarithmicPitch) - std::log(440.0)) / std::numbers::ln2));
     }
     WaveformLevel base;
-    base.peaks.reserve((rendered.samples.size() + base.samplesPerPeak - 1) / base.samplesPerPeak);
-    for (std::size_t first = 0; first < rendered.samples.size(); first += base.samplesPerPeak)
+    base.peaks.reserve((samples.size() + base.samplesPerPeak - 1) / base.samplesPerPeak);
+    for (std::size_t first = 0; first < samples.size(); first += base.samplesPerPeak)
     {
-        const auto end = std::min(first + base.samplesPerPeak, rendered.samples.size());
-        const auto range = juce::FloatVectorOperations::findMinAndMax(rendered.samples.data() + first, end - first);
+        const auto end = std::min(first + base.samplesPerPeak, samples.size());
+        const auto range = juce::FloatVectorOperations::findMinAndMax(samples.data() + first, static_cast<int>(end - first));
         const WaveformPeak peak{range.getStart(), range.getEnd()};
         data->peakMagnitude = std::max({data->peakMagnitude, std::abs(peak.minimum), std::abs(peak.maximum)});
         base.peaks.push_back(peak);
@@ -1358,7 +1358,10 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                     }
                     if (visualization != nullptr)
                     {
-                        appendVisualization(visualization->tracks[prepared.projectIndex], track, notes, startSeconds, stopSeconds, cached->visualization);
+                        const auto display = cached->visualization != nullptr
+                                                 ? cached->visualization
+                                                 : makeVisualization(cached->samples, cached->sampleRate, cached->frameIntervalSeconds, cached->logF0);
+                        appendVisualization(visualization->tracks[prepared.projectIndex], track, notes, startSeconds, stopSeconds, display);
                     }
                     if (!automaticPitch.empty() && (cached->pitchFrameIntervalSeconds != pitchFrameInterval || !samePitchNotes(cached->pitchNotes, pitchNotes) || cached->pitchEnvelope != pitchEnvelope))
                     {
@@ -1400,9 +1403,10 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                         return trackError(track, result.getErrorMessage());
                     }
                 }
-                auto display = makeVisualization(rendered, frameInterval, logF0);
+                std::shared_ptr<const PhraseVisualization> display;
                 if (visualization != nullptr)
                 {
+                    display = makeVisualization(rendered.samples, rendered.sampleRate, frameInterval, logF0);
                     appendVisualization(visualization->tracks[prepared.projectIndex], track, notes, startSeconds, stopSeconds, display);
                 }
                 ++statistics.renderedPhrases;
