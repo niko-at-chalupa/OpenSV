@@ -11,16 +11,24 @@ namespace sv
 {
 namespace
 {
-constexpr int undoBudgetBytes = 64 * 1024 * 1024;
+// Total memory allocated for undo/redo snapshots before old actions are evicted.
+constexpr int undoBudgetBytes = 64 * 1024 * 1024; // 64 MB budget
 
+/**
+ * @brief Approximates memory usage in bytes of a ParameterCurve.
+ */
 std::size_t curveStorageBytes(const ParameterCurve& curve)
 {
     return curve.mode.size() + curve.preservedFieldsJson.size() + curve.points.size() * sizeof(AutomationPoint);
 }
 
+/**
+ * @brief Approximates memory usage in bytes of a NoteGroup (including all notes and curves).
+ */
 std::size_t groupBytes(const NoteGroup& group)
 {
-    std::size_t bytes = sizeof(group) + group.id.size() + group.name.size() + group.preservedFieldsJson.size() + curveStorageBytes(group.pitchDelta) + curveStorageBytes(group.vibratoEnv);
+    std::size_t bytes = sizeof(group) + group.id.size() + group.name.size() + group.preservedFieldsJson.size()
+                      + curveStorageBytes(group.pitchDelta) + curveStorageBytes(group.vibratoEnv);
     for (const auto& [name, curve] : group.vocalModes)
     {
         bytes += name.size() + curveStorageBytes(curve.curve) + curve.preservedFieldsJson.size();
@@ -28,14 +36,20 @@ std::size_t groupBytes(const NoteGroup& group)
     for (const auto& note : group.notes)
     {
         bytes += sizeof(note) + note.lyrics.size() + note.phonemes.size() + note.preservedFieldsJson.size();
-        bytes += note.musicalType.size() + note.accent.size() + note.attributes.preservedFieldsJson.size() + note.systemAttributes.preservedFieldsJson.size();
+        bytes += note.musicalType.size() + note.accent.size() + note.attributes.preservedFieldsJson.size()
+               + note.systemAttributes.preservedFieldsJson.size();
     }
     return bytes;
 }
 
+/**
+ * @brief Approximates memory usage in bytes of a GroupReference.
+ */
 std::size_t referenceBytes(const GroupReference& reference)
 {
-    std::size_t bytes = sizeof(reference) + reference.groupId.size() + reference.audioFile.size() + reference.preservedFieldsJson.size() + reference.voicePitch.preservedFieldsJson.size() + reference.vocalModePreset.size() + curveStorageBytes(reference.systemPitchDelta);
+    std::size_t bytes = sizeof(reference) + reference.groupId.size() + reference.audioFile.size()
+                      + reference.preservedFieldsJson.size() + reference.voicePitch.preservedFieldsJson.size()
+                      + reference.vocalModePreset.size() + curveStorageBytes(reference.systemPitchDelta);
     for (const auto& [name, amount] : reference.vocalModeParams)
     {
         static_cast<void>(amount);
@@ -44,12 +58,18 @@ std::size_t referenceBytes(const GroupReference& reference)
     return bytes;
 }
 
+/**
+ * @brief Approximates memory usage in bytes of an entire Project snapshot.
+ *
+ * Used by UndoableAction::getSizeInUnits to ensure undoManager does not exceed undoBudgetBytes.
+ */
 std::size_t projectBytes(const Project& project)
 {
     std::size_t bytes = sizeof(project) + project.name.size() + project.preservedFieldsJson.size();
     for (const auto& track : project.tracks)
     {
-        bytes += sizeof(track) + track.name.size() + track.preservedFieldsJson.size() + groupBytes(track.mainGroup) + referenceBytes(track.mainRef);
+        bytes += sizeof(track) + track.name.size() + track.preservedFieldsJson.size()
+               + groupBytes(track.mainGroup) + referenceBytes(track.mainRef);
         bytes += track.voice.databasePath.size() + track.voice.language.size() + track.voice.dictionaryDirectory.size();
         for (const auto& reference : track.groups)
         {
@@ -72,6 +92,12 @@ std::size_t projectBytes(const Project& project)
 }
 } // namespace
 
+/**
+ * @brief JUCE UndoableAction implementation storing before/after mementos of the Project.
+ *
+ * When an edit occurs, deep copies of both previous and resulting states are retained.
+ * Performing restores the 'after' state; undoing restores the 'before' state.
+ */
 class ProjectDocument::EditAction final : public juce::UndoableAction
 {
 public:
@@ -127,7 +153,7 @@ void ProjectDocument::setActiveTrackIndex(int index)
     if (activeTrackIndex != bounded)
     {
         activeTrackIndex = bounded;
-        selectedNoteIds.clear();
+        selectedNoteIds.clear(); // Switching tracks clears note selection
         sendChangeMessage();
     }
 }
@@ -156,9 +182,13 @@ void ProjectDocument::setSelectedNoteIds(std::vector<NoteId> ids)
 
 void ProjectDocument::performEdit(const juce::String& name, const std::function<void(Project&)>& edit)
 {
+    // Clone project to prepare new state
     Project next = project;
     edit(next);
+    // Enforce model invariants (sorted notes, valid IDs, clamp pitch)
     normaliseProject(next);
+
+    // Record transaction in UndoManager
     undoManager.beginNewTransaction(name);
     undoManager.perform(new EditAction(*this, project, std::move(next), currentStateId, nextStateId++));
 }
@@ -286,7 +316,7 @@ void ProjectDocument::applyState(const Project& state, std::uint64_t stateId)
 {
     project = state;
     currentStateId = stateId;
-    ++revision;
+    ++revision; // Signal UI that model was modified
     activeTrackIndex = std::clamp(activeTrackIndex, 0, static_cast<int>(project.tracks.size()) - 1);
     pruneSelection();
     sendChangeMessage();
@@ -304,17 +334,20 @@ void ProjectDocument::reset(Project replacement, const juce::File& source)
     savedStateId = currentStateId;
     explicitlyModified = false;
     ++revision;
-    ++generation;
+    ++generation; // Bumping generation causes background renderer to purge voice caches
     sendChangeMessage();
 }
 
 void ProjectDocument::pruneSelection()
 {
     const auto& notes = getActiveGroup().notes;
+    // Remove any note ID that does not exist in the active note group
     std::erase_if(selectedNoteIds, [&notes](NoteId id)
                   { return std::none_of(notes.begin(), notes.end(), [id](const Note& note)
                                         { return note.id == id; }); });
+    // Sort and deduplicate selected note IDs
     std::sort(selectedNoteIds.begin(), selectedNoteIds.end());
     selectedNoteIds.erase(std::unique(selectedNoteIds.begin(), selectedNoteIds.end()), selectedNoteIds.end());
 }
+
 } // namespace sv

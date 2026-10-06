@@ -14,27 +14,61 @@
 
 namespace sv::synthesis
 {
+/**
+ * @brief 2D tensor representation for neural network inputs, activations, and outputs.
+ *
+ * Data layout:
+ * - frames: Time steps / sequence length (rows).
+ * - channels: Feature dimension / channels per time step (columns).
+ * - values: Flattened row-major array: values[frame * channels + channel].
+ */
 struct DnniTensor
 {
-    std::size_t frames = 0;
-    std::size_t channels = 0;
-    // Frame-major: values[frame * channels + channel].
-    std::vector<float> values;
+    std::size_t frames = 0;    ///< Sequence length (time dimension).
+    std::size_t channels = 0;  ///< Number of channels/features per frame.
+    std::vector<float> values; ///< Frame-major flattened array of floats.
 };
 
+/**
+ * @brief Operational statistics for a single neural inference pass.
+ */
 struct DnniRunStatistics
 {
-    // Accumulated network output frames, not acoustic frames or audio samples.
-    std::size_t computedFrames = 0;
-    std::size_t reusedFrames = 0;
-    std::size_t contextFrames = 0;
+    std::size_t computedFrames = 0; ///< Output frames evaluated from scratch.
+    std::size_t reusedFrames = 0;   ///< Frames retrieved from cache without evaluating layers.
+    std::size_t contextFrames = 0;  ///< Additional receptive field context frames processed.
 };
 
+/**
+ * @brief High-performance neural network inference engine with SIMD vectorization and caching.
+ *
+ * Supported neural architectures and layer types:
+ * - Linear / Dense layers (`modl0`)
+ * - 1D Dilated / Causal Convolutions (`modl1`)
+ * - WaveNet-style Residual Dilated Convolution blocks (`_ncwnv0`) with Gated Convolutions (`_gnc1v0`)
+ * - Gated Recurrent Units (GRU) (`modl3`) and Bidirectional GRUs (`modl4`)
+ * - Non-linear activation functions: ReLU (`moda0`), Tanh (`moda1`), Sigmoid (`moda2`),
+ *   LeakyReLU (`moda3`), ELU (`moda4`), Identity (`moda5`), SiLU/Swish (`moda7`)
+ *
+ * SIMD Optimization:
+ * - Uses `juce::dsp::SIMDRegister<float>` (AVX/SSE/NEON) with blocked weight layouts
+ *   (4 vectors per block = 16 or 32 channels per block).
+ *
+ * Incremental Inference (Cache):
+ * - For convolutional networks with finite receptive fields, `DnniInference::Cache` detects
+ *   which parts of the input sequence changed, expands only the affected frames by the
+ *   receptive field context radius, runs inference on that slice, and pastes the result back.
+ */
 class DnniInference
 {
 public:
-    // Own one cache per phrase and network on the synthesis worker, separately
-    // from shared immutable model parameters. Clearing releases all snapshots.
+    /**
+     * @brief Per-phrase inference cache supporting incremental dirty-range re-synthesis.
+     *
+     * Invariants:
+     * - One Cache instance belongs to one phrase on the synthesis worker thread.
+     * - Must not be accessed concurrently across multiple threads.
+     */
     class Cache
     {
     public:
@@ -50,12 +84,31 @@ public:
         bool hasCondition = false;
     };
 
-    // Copies decoded parameters; the reader need not outlive this object.
+    /**
+     * @brief Loads and initializes neural network weights and structure from a parsed DNNI model.
+     *
+     * @param reader Parsed DNNI reader.
+     * @param rootNode Root node index in reader's node list (defaults to 0).
+     * @return juce::Result::ok() or failure description.
+     */
     [[nodiscard]] juce::Result load(const DnniReader& reader, std::size_t rootNode = 0);
-    // Floating-point inference outside the audio callback. A cache permits exact
-    // finite-context reuse for frame-preserving networks; other networks run whole.
-    // Quantized parameters are decoded to floats, not evaluated with the original integer kernels.
-    // Conditional gate blocks require the matching condition tensor; no zero condition is supplied.
+
+    /**
+     * @brief Executes neural network forward inference.
+     *
+     * Invariants:
+     * - Runs outside the real-time audio thread.
+     * - Cancellation: `shouldCancel` is queried periodically between layer evaluations.
+     * - Output tensor is populated on success; left untouched on failure or cancellation.
+     *
+     * @param input Input feature tensor [frames, inputChannels].
+     * @param output Output tensor [frames, outputChannels].
+     * @param condition Optional conditioning tensor (e.g. speaker embeddings, pitch contour).
+     * @param cache Optional cache for incremental re-rendering of dirty phrase segments.
+     * @param shouldCancel Callback returning true if rendering has been aborted by user.
+     * @param statistics Optional pointer to record frame counters.
+     * @return juce::Result::ok() or error.
+     */
     [[nodiscard]] juce::Result run(const DnniTensor& input, DnniTensor& output, const DnniTensor* condition = nullptr, Cache* cache = nullptr, const std::function<bool()>& shouldCancel = {}, DnniRunStatistics* statistics = nullptr) const;
 
 private:
@@ -66,27 +119,29 @@ private:
 
     enum class Operation
     {
-        sequence,
-        dense,
-        convolution,
-        gatedConvolution,
-        residualConvolution,
-        gru,
-        bidirectionalGru,
-        relu,
-        tanh,
-        sigmoid,
-        leakyRelu,
-        elu,
-        identity,
-        silu
+        sequence,               ///< Sequential container of layers
+        dense,                  ///< Fully-connected affine transformation (x * W^T + b)
+        convolution,            ///< 1D convolution with kernel size, stride, padding, dilation
+        gatedConvolution,       ///< Gated activation unit: tanh(W_f * x) * sigmoid(W_g * x)
+        residualConvolution,    ///< WaveNet residual stack with skip connections
+        gru,                    ///< Unidirectional Gated Recurrent Unit
+        bidirectionalGru,       ///< Bidirectional GRU (forward + backward concatenated)
+        relu,                   ///< Rectified Linear Unit: max(0, x)
+        tanh,                   ///< Hyperbolic tangent
+        sigmoid,                ///< Logistic sigmoid: 1 / (1 + exp(-x))
+        leakyRelu,              ///< Leaky ReLU: x >= 0 ? x : alpha * x
+        elu,                    ///< Exponential Linear Unit
+        identity,               ///< Pass-through identity
+        silu                    ///< Sigmoid Linear Unit (Swish): x * sigmoid(x)
     };
 
+    /**
+     * @brief Blocked weight matrix layout tailored for SIMD dot products.
+     */
     struct Matrix
     {
         std::size_t rows = 0;
         std::size_t columns = 0;
-        // Output block, then input column. The SIMD value type guarantees aligned storage.
         std::vector<WeightBlock> values;
     };
 
@@ -119,4 +174,5 @@ private:
     std::uint64_t modelIdentity = 0;
     bool loaded = false;
 };
+
 } // namespace sv::synthesis

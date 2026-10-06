@@ -14,9 +14,13 @@ namespace sv::synthesis
 {
 namespace
 {
-constexpr std::size_t maximumConfigurationBytes = 1024 * 1024;
+// Maximum size limit for configuration blob to guard against malformed files
+constexpr std::size_t maximumConfigurationBytes = 1024 * 1024; // 1 MiB
 constexpr std::uint32_t maximumEntries = 16384;
 
+/**
+ * @brief Helper stream reader for little-endian primitive types in configuration buffers.
+ */
 class ConfigurationReader
 {
 public:
@@ -82,19 +86,38 @@ private:
     std::size_t position = 0;
 };
 
+/**
+ * @brief Checks if a string view is valid printable UTF-8 text.
+ */
 bool isText(std::string_view value)
 {
-    return value.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()) && std::none_of(value.begin(), value.end(), [](char character)
-                                                                                                     { return static_cast<unsigned char>(character) < 0x20 || character == 0x7f; }) &&
+    return value.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+           std::none_of(value.begin(), value.end(), [](char character)
+                        { return static_cast<unsigned char>(character) < 0x20 || character == 0x7f; }) &&
            juce::CharPointer_UTF8::isValidString(value.data(), static_cast<int>(value.size()));
 }
 
+/**
+ * @brief De-obfuscates an entry name key using a Linear Congruential Generator (LCG) XOR cipher.
+ *
+ * Reverse-engineering details:
+ * In Synthesizer V binaries (e.g. Mach-O symbol 0x100023E90), entry keys in the
+ * voice configuration block are lightly obfuscated using a pseudo-random sequence.
+ * The loop at 0x100023272 XORs each raw byte with the lowest 8 bits of the current LCG state.
+ *
+ * LCG parameters:
+ * - Initial state: 0xbefcb5e0
+ * - Multiplier: 0x41c64e6d (1103515245, identical to standard POSIX / MSVC rand())
+ * - Additive constant: 0x3039 (12345)
+ *
+ * Formula per byte:
+ * decoded[i] = bytes[i] ^ (state & 0xFF)
+ * state = state * 0x41c64e6d + 0x3039
+ */
 std::string decodeName(const juce::MemoryBlock& value)
 {
     const auto* bytes = static_cast<const std::uint8_t*>(value.getData());
     std::string decoded(value.getSize(), '\0');
-    // Mach-O 0x100023E90 generates this position-dependent sequence; the
-    // string loop at 0x100023272 XORs its low byte with each stored byte.
     std::uint32_t state = 0xbefcb5e0;
     for (std::size_t index = 0; index < value.getSize(); ++index)
     {
@@ -104,6 +127,19 @@ std::string decodeName(const juce::MemoryBlock& value)
     return decoded;
 }
 
+/**
+ * @brief Parses the raw binary configuration payload into VoiceConfigurationEntry records.
+ *
+ * Binary layout:
+ * - 4 bytes: Magic signature (0x0000FEFF)
+ * - 4 bytes: Entry count N
+ * - Followed by N entry records:
+ *   - 4 bytes: Type (0 = strings, 1 = numbers, 2 = integers)
+ *   - 4 bytes: Ordinal (entry sequence ID)
+ *   - 2 bytes length + string bytes: Obfuscated key name
+ *   - 4 bytes: Value count M
+ *   - Followed by M values corresponding to Type
+ */
 juce::Result parseConfiguration(const juce::MemoryBlock& bytes, std::vector<VoiceConfigurationEntry>& entries)
 {
     if (bytes.getSize() < 8 || bytes.getSize() > maximumConfigurationBytes)
@@ -121,8 +157,10 @@ juce::Result parseConfiguration(const juce::MemoryBlock& bytes, std::vector<Voic
     {
         return reader.error("entry count exceeds the remaining data or resource limit.");
     }
+
     std::unordered_set<std::uint32_t> ordinals;
     entries.reserve(count);
+
     for (std::uint32_t index = 0; index < count; ++index)
     {
         VoiceConfigurationEntry entry;
@@ -136,11 +174,13 @@ juce::Result parseConfiguration(const juce::MemoryBlock& bytes, std::vector<Voic
         {
             return reader.error("duplicate entry ordinal.");
         }
+
         entry.name = decodeName(entry.key);
         if (entry.name.empty() || !isText(entry.name))
         {
             return reader.error("entry name is not valid printable UTF-8.");
         }
+
         if (type == static_cast<std::uint32_t>(VoiceConfigurationType::strings))
         {
             if (valueCount > reader.remaining() / 2)
@@ -202,6 +242,9 @@ juce::Result parseConfiguration(const juce::MemoryBlock& bytes, std::vector<Voic
     return juce::Result::ok();
 }
 
+/**
+ * @brief Finds a single string-valued configuration entry by its de-obfuscated name.
+ */
 juce::Result findSingleString(const std::vector<VoiceConfigurationEntry>& entries, std::string_view name, juce::MemoryBlock& value)
 {
     const VoiceConfigurationEntry* found = nullptr;
@@ -225,6 +268,9 @@ juce::Result findSingleString(const std::vector<VoiceConfigurationEntry>& entrie
     return juce::Result::ok();
 }
 
+/**
+ * @brief Resolves a neural network model reference from configuration fields into a ModelReference struct.
+ */
 juce::Result readModelReference(const std::vector<VoiceConfigurationEntry>& entries, const VoiceDatabase& database, std::string_view keyField, std::string_view architectureField, ModelReference& model)
 {
     if (auto result = findSingleString(entries, keyField, model.key); result.failed())
@@ -262,6 +308,7 @@ juce::Result VoiceConfiguration::load(VoiceDatabase& database)
     try
     {
         const auto& databaseEntries = database.getEntries();
+        // In NOFS voice archives, the main configuration table is located by a 1-byte key: 0x91.
         const auto configuration = std::find_if(databaseEntries.begin(), databaseEntries.end(), [](const VoiceEntry& entry)
                                                 { return entry.key.getSize() == 1 && *static_cast<const std::uint8_t*>(entry.key.getData()) == 0x91; });
         if (configuration == databaseEntries.end())
@@ -272,6 +319,8 @@ juce::Result VoiceConfiguration::load(VoiceDatabase& database)
         {
             return juce::Result::fail("Voice configuration exceeds the 1 MiB limit.");
         }
+
+        // Read and parse configuration entry payload
         juce::MemoryBlock bytes;
         if (auto result = database.readEntry(*configuration, bytes); result.failed())
         {
@@ -282,18 +331,24 @@ juce::Result VoiceConfiguration::load(VoiceDatabase& database)
         {
             return result;
         }
+
+        // Resolve model references for duration, acoustic, and vocoder models:
+        // 1. Duration / phoneme timing model: "model_duration", architecture: "model_duration_arch"
         if (auto result = readModelReference(replacement.entries, database, "model_duration", "model_duration_arch", replacement.duration); result.failed())
         {
             return result;
         }
+        // 2. Acoustic / timbre model: "model_timbre_pred", architecture: "model_timbre_arch"
         if (auto result = readModelReference(replacement.entries, database, "model_timbre_pred", "model_timbre_arch", replacement.acoustic); result.failed())
         {
             return result;
         }
+        // 3. Vocoder model: "model_vocoder", architecture: "model_vocoder_arch"
         if (auto result = readModelReference(replacement.entries, database, "model_vocoder", "model_vocoder_arch", replacement.vocoder); result.failed())
         {
             return result;
         }
+
         *this = std::move(replacement);
         return juce::Result::ok();
     }
@@ -322,4 +377,5 @@ const ModelReference& VoiceConfiguration::getVocoderModel() const noexcept
 {
     return vocoder;
 }
+
 } // namespace sv::synthesis

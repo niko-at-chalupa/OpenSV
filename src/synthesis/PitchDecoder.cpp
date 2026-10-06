@@ -13,30 +13,49 @@ namespace sv::synthesis
 {
 namespace
 {
+/// Memory limit safety ceiling (64 million single-precision elements ~ 256 MB) to prevent out-of-memory crashes.
 constexpr std::size_t maximumElements = 64 * 1024 * 1024;
 
+/**
+ * @brief Reads a 32-bit little-endian integer from a byte buffer.
+ */
 std::uint32_t readUint32(std::span<const std::uint8_t> bytes, std::size_t offset)
 {
     return static_cast<std::uint32_t>(bytes[offset]) | (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) | (static_cast<std::uint32_t>(bytes[offset + 2]) << 16) | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
 }
 
+/**
+ * @brief Validates tensor dimensions and checks that all values are finite.
+ */
 bool validTensor(const DnniTensor& tensor)
 {
     return tensor.channels > 0 && tensor.channels <= maximumElements && tensor.frames <= maximumElements / tensor.channels && tensor.values.size() == tensor.frames * tensor.channels && std::all_of(tensor.values.begin(), tensor.values.end(), [](float value)
-                                                                                                                                                                                                     { return std::isfinite(value); });
+                                                                                                                                                                                                      { return std::isfinite(value); });
 }
 
+/**
+ * @brief Checks if all elements in a float slice are finite numbers (no NaN or Inf).
+ */
 bool finiteValues(std::span<const float> values)
 {
     return std::all_of(values.begin(), values.end(), [](float value)
                        { return std::isfinite(value); });
 }
 
+/**
+ * @brief Helper for generating standardized failure results from the pitch decoder.
+ */
 juce::Result decoderError(const juce::String& reason)
 {
     return juce::Result::fail("Pitch decoder: " + reason);
 }
 
+/**
+ * @brief Upsamples a downsampled/grouped tensor by repeating each group's channel vector `stride` times.
+ *
+ * For example, if input has `groups` frames, output will have `frames` frames where frame `t` copies
+ * from group `t / stride`.
+ */
 DnniTensor repeatFrames(const DnniTensor& input, std::size_t frames, std::size_t stride)
 {
     DnniTensor output{frames, input.channels, std::vector<float>(frames * input.channels)};
@@ -47,6 +66,13 @@ DnniTensor repeatFrames(const DnniTensor& input, std::size_t frames, std::size_t
     return output;
 }
 
+/**
+ * @brief Computes a statistical quantile (in-place partial sort using std::nth_element).
+ *
+ * @param values Mutable vector of values to partition.
+ * @param position Normalized quantile in [0.0, 1.0] (e.g. 0.5 for median, 0.8 for 80th percentile).
+ * @return The value at the quantile index.
+ */
 float quantile(std::vector<float>& values, float position)
 {
     if (values.empty())
@@ -59,6 +85,18 @@ float quantile(std::vector<float>& values, float position)
     return *selected;
 }
 
+/**
+ * @brief Expands per-note control scalars (e.g. tilt, shift) into a continuous per-frame signal.
+ *
+ * Synthesizer V Gen5 smooths transitions across note boundaries by extending each note's influence
+ * by 5 frames (25 ms) before onset and after offset, weighting the value by a two-sided sigmoid:
+ * weight = 1 / [ (1 + exp(-(duration - localFrame))) * (1 + exp(-localFrame)) ].
+ *
+ * @param counts Frame duration count of each note.
+ * @param values Control value per note.
+ * @param frames Total number of frames in the phrase.
+ * @return Continuous per-frame expanded signal.
+ */
 std::vector<float> expandNoteValues(std::span<const std::size_t> counts, std::span<const float> values, std::size_t frames)
 {
     std::vector<float> output(frames, 0.0f);
@@ -72,7 +110,7 @@ std::vector<float> expandNoteValues(std::span<const std::size_t> counts, std::sp
             const auto end = std::min(duration + 5, static_cast<std::int64_t>(frames) - onset);
             for (auto localFrame = first; localFrame < end; ++localFrame)
             {
-                // Gen5 extends a note's control by five 5 ms frames on each side.
+                // Gen5 extends a note's control by five 5 ms frames on each side with smooth sigmoid tapering.
                 const auto weight = static_cast<float>(1.0 / ((1.0 + std::exp(-static_cast<double>(duration - localFrame))) * (1.0 + std::exp(-static_cast<double>(localFrame)))));
                 output[static_cast<std::size_t>(onset + localFrame)] += values[note] * weight;
             }
@@ -87,11 +125,22 @@ juce::Result PitchDecoder::load(const DnniReader& reader, std::size_t nodeIndex)
 {
     loaded = false;
     const auto& nodes = reader.getNodes();
-    constexpr std::array<std::uint64_t, 12> decoderTypes{0x67133569b1e0c9a7, 0x0833163a9cfbe985, 0x9d1ceeb019e4ee82, 0xc2d683aaffb9c539, 0x7878dd761d208ab5, 0x833c88b73fdaad72, 0x83853dd7b2ffc31b, 0xcd0750935e49d6e3, 0x37277fa85c86b715, 0x0dcc23701223d7ca, 0xe886cc8e9fe491d4, 0xca7b4a8a02707df0};
+
+    // Recognized 64-bit type identifiers for Gen5 pitch decoder containers across various voice versions.
+    constexpr std::array<std::uint64_t, 12> decoderTypes{
+        0x67133569b1e0c9a7, 0x0833163a9cfbe985, 0x9d1ceeb019e4ee82, 0xc2d683aaffb9c539,
+        0x7878dd761d208ab5, 0x833c88b73fdaad72, 0x83853dd7b2ffc31b, 0xcd0750935e49d6e3,
+        0x37277fa85c86b715, 0x0dcc23701223d7ca, 0xe886cc8e9fe491d4, 0xca7b4a8a02707df0};
+
     if (nodeIndex >= nodes.size() || std::find(decoderTypes.begin(), decoderTypes.end(), nodes[nodeIndex].typeId) == decoderTypes.end() || nodes[nodeIndex].children.size() != networks.size())
     {
         return decoderError("expected the gen5 nine-network decoder.");
     }
+
+    // 12-byte payload:
+    // [0..3]: int32_t embeddingChannels (e.g. 64)
+    // [4..7]: float   embeddingScale
+    // [8..11]: int32_t frameStride (e.g. 4)
     const auto payload = reader.getPayload(nodeIndex);
     if (payload.size() != 12)
     {
@@ -104,6 +153,8 @@ juce::Result PitchDecoder::load(const DnniReader& reader, std::size_t nodeIndex)
     {
         return decoderError("invalid sinusoidal embedding or frame-group dimensions.");
     }
+
+    // Load each of the 9 child inference sub-networks
     for (std::size_t index = 0; index < networks.size(); ++index)
     {
         if (const auto result = networks[index].load(reader, nodes[nodeIndex].children[index]); result.failed())
@@ -117,6 +168,7 @@ juce::Result PitchDecoder::load(const DnniReader& reader, std::size_t nodeIndex)
     loaded = true;
     return juce::Result::ok();
 }
+
 
 juce::Result PitchDecoder::run(const DnniTensor& context, const DnniTensor& scalarContext, std::span<const float> noise, const DnniTensor& controls, std::span<const float> vibratoControl, const PitchFeatures& frontend, PitchDecoderNotes& notes, DnniTensor& output, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics) const
 {

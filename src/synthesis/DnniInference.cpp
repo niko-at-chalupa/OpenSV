@@ -41,6 +41,10 @@ bool finiteValues(const std::vector<float>& values)
     return std::all_of(values.begin(), values.end(), [](float value)
                        { return std::isfinite(value); });
 }
+/**
+ * @brief Numerically stable logistic sigmoid activation: 1 / (1 + exp(-x)).
+ * Avoids floating-point overflow for large negative or positive inputs.
+ */
 float sigmoid(float value)
 {
     const auto exponential = std::exp(-std::abs(value));
@@ -52,17 +56,31 @@ bool sameShape(const DnniTensor& first, const DnniTensor& second)
     return first.frames == second.frames && first.channels == second.channels && first.values.size() == second.values.size();
 }
 
+/**
+ * @brief Represents a continuous range of frames [first, end) in time.
+ */
 struct FrameRange
 {
     std::size_t first = 0;
     std::size_t end = 0;
 };
 
+/**
+ * @brief Expands a frame range by a given context radius (receptive field padding),
+ * clamped to total frame count [0, frames].
+ */
 FrameRange expandRange(FrameRange range, std::size_t radius, std::size_t frames)
 {
     return {range.first > radius ? range.first - radius : 0, range.end + std::min(radius, frames - range.end)};
 }
 
+/**
+ * @brief Identifies segments of output frames that must be recomputed due to changed inputs.
+ *
+ * Compares current input tensor (and optional condition tensor) against cached inputs.
+ * When differences are detected, the affected frame ranges are expanded by the receptive
+ * field radius of the convolutional network, merging adjacent or overlapping windows.
+ */
 std::vector<FrameRange> findChangedOutputRanges(const DnniTensor& previous, const DnniTensor& current, const DnniTensor* previousCondition, const DnniTensor* currentCondition, std::size_t radius)
 {
     std::vector<FrameRange> ranges;
@@ -834,6 +852,13 @@ juce::Result DnniInference::run(const DnniTensor& input, DnniTensor& output, con
     }
 }
 
+/**
+ * @brief Performs SIMD-vectorized matrix-vector multiplication: output = matrix * input.
+ *
+ * Vectorization strategy:
+ * - Operates in blocks of channelsPerBlock (4 SIMD registers = 16 or 32 floats).
+ * - For each block of rows, broadcasts input[column] across the register and accumulates dot products.
+ */
 void DnniInference::multiplyMatrix(const Matrix& matrix, const float* input, float* output)
 {
     for (std::size_t firstChannel = 0; firstChannel < matrix.rows; firstChannel += channelsPerBlock)
@@ -860,6 +885,23 @@ void DnniInference::multiplyMatrix(const Matrix& matrix, const float* input, flo
     }
 }
 
+/**
+ * @brief Executes Gated Recurrent Unit (GRU) forward pass over the sequence.
+ *
+ * Model weights structure (`modl3`):
+ * - 6 projection matrices:
+ *   - Projections 0..2: Input-to-hidden projections for reset (r), update (z), and candidate (n) gates
+ *   - Projections 3..5: Hidden-to-hidden recurrent projections for r, z, and n
+ * - Bias vector has 6 * hiddenChannels entries: [b_ir, b_iz, b_in, b_hr, b_hz, b_hn]
+ *
+ * Recurrence equations (PyTorch reset_after=True convention):
+ * 1. Reset gate:  r_t = sigmoid(W_ir * x_t + b_ir + W_hr * h_{t-1} + b_hr)
+ * 2. Update gate: z_t = sigmoid(W_iz * x_t + b_iz + W_hz * h_{t-1} + b_hz)
+ * 3. Candidate:   n_t = tanh(W_in * x_t + b_in + r_t * (W_hn * h_{t-1} + b_hn))
+ * 4. Hidden state update: h_t = z_t * h_{t-1} + (1 - z_t) * n_t
+ *
+ * @param reverse If true, runs backward from last frame to first (for bidirectional GRU).
+ */
 juce::Result DnniInference::runGru(const Layer& layer, const DnniTensor& input, DnniTensor& output, bool reverse, const std::function<bool()>& shouldCancel)
 {
     if (input.channels != layer.inputChannels || !validShape(input.frames, layer.gateChannels))
@@ -889,9 +931,7 @@ juce::Result DnniInference::runGru(const Layer& layer, const DnniTensor& input, 
         {
             return nodeError(layer.sourceOffset, "GRU projection produced a non-finite value.");
         }
-        // modl3 stores input r/z/n followed by recurrent r/z/n, each with
-        // its own bias. The reset gate follows the candidate's recurrent
-        // projection, including its bias; it does not gate hidden before U.
+        // Evaluate gates per channel
         for (std::size_t channel = 0; channel < hiddenChannels; ++channel)
         {
             const auto resetInput = layer.bias[channel] + layer.bias[3 * hiddenChannels + channel] + projections[channel] + projections[3 * hiddenChannels + channel];
@@ -967,6 +1007,11 @@ juce::Result DnniInference::runLayer(const Layer& layer, const DnniTensor& input
         return juce::Result::ok();
     }
 
+    // --- Residual Dilated Convolution Stack (_ncwnv0 / WaveNet architecture) ---
+    // Contains stageCount stages of:
+    // 1. Dilated gated convolution unit (children[stage * 3])
+    // 2. Skip projection (children[stage * 3 + 1]) -> accumulated directly into output
+    // 3. Residual projection (children[stage * 3 + 2]) -> added back to input for the next stage
     if (layer.operation == Operation::residualConvolution)
     {
         if (input.channels != layer.inputChannels)
@@ -1016,8 +1061,9 @@ juce::Result DnniInference::runLayer(const Layer& layer, const DnniTensor& input
             {
                 return nodeError(layer.sourceOffset, "residual convolution branches produced incompatible shapes.");
             }
-            // The skip branch observes the gate before the residual is added.
+            // Skip connection contributes to overall network output
             juce::FloatVectorOperations::add(output.values.data(), skip.values.data(), output.values.size());
+            // Residual connection feeds into next dilated stage
             juce::FloatVectorOperations::add(gated.values.data(), residual.values.data(), gated.values.size());
             if (!finiteValues(output.values) || !finiteValues(gated.values))
             {
@@ -1028,6 +1074,9 @@ juce::Result DnniInference::runLayer(const Layer& layer, const DnniTensor& input
         return juce::Result::ok();
     }
 
+    // --- Gated Convolutional Unit (_gnc1v0) ---
+    // Formula: output = tanh(filter) * sigmoid(gate)
+    // where input is projected to 2 * gateChannels (first half = filter, second half = gate)
     if (layer.operation == Operation::gatedConvolution)
     {
         if (input.channels != layer.inputChannels)

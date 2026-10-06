@@ -12,15 +12,29 @@ namespace sv
 {
 namespace
 {
+/**
+ * @brief Target Synthesizer V format version.
+ * 153 corresponds to Synthesizer V Studio 1.11.2 project format.
+ */
 constexpr int projectFormatVersion = 153;
+
+/**
+ * @brief Safety boundary for timeline Blick values in files to prevent overflow during calculations.
+ */
 constexpr Blick maximumFileBlick = std::numeric_limits<Blick>::max() / 4;
 
+/**
+ * @brief Mapping between JSON property names and member pointers of struct PitchAttributes.
+ */
 struct PitchAttributeField
 {
     const char* name;
     std::optional<double> PitchAttributes::* member;
 };
 
+/**
+ * @brief Table of all supported pitch and vibrato attribute keys in the SVP JSON format.
+ */
 constexpr std::array pitchAttributeFields{
     PitchAttributeField{"tF0Offset", &PitchAttributes::tF0Offset},
     PitchAttributeField{"tF0Left", &PitchAttributes::tF0Left},
@@ -37,16 +51,25 @@ constexpr std::array pitchAttributeFields{
     PitchAttributeField{"rTone", &PitchAttributes::rTone},
     PitchAttributeField{"rIntonation", &PitchAttributes::rIntonation}};
 
+/**
+ * @brief Allocates an empty dynamic JSON object wrapped in juce::var.
+ */
 juce::var makeObject()
 {
     return juce::var(new juce::DynamicObject());
 }
 
+/**
+ * @brief Constructs a juce::String from standard UTF-8 text.
+ */
 juce::String utf8(const std::string& text)
 {
     return juce::String::fromUTF8(text.data(), static_cast<int>(text.size()));
 }
 
+/**
+ * @brief Restores a previously preserved JSON string into a juce::var object.
+ */
 juce::var retainedObject(const std::string& json)
 {
     if (!json.empty())
@@ -60,17 +83,26 @@ juce::var retainedObject(const std::string& json)
     return makeObject();
 }
 
+/**
+ * @brief Clones a named nested object property if present, or creates a new empty object.
+ */
 juce::var objectProperty(const juce::var& parent, const juce::Identifier& name)
 {
     const auto& value = parent[name];
     return value.isObject() ? value.clone() : makeObject();
 }
 
+/**
+ * @brief Helper to set a property on a dynamic JSON object.
+ */
 void set(juce::var& object, const juce::Identifier& name, const juce::var& value)
 {
     object.getDynamicObject()->setProperty(name, value);
 }
 
+/**
+ * @brief Sets a property on an object only if the property does not already exist.
+ */
 void setDefault(juce::var& object, const juce::Identifier& name, const juce::var& value)
 {
     if (!object.hasProperty(name))
@@ -79,6 +111,14 @@ void setDefault(juce::var& object, const juce::Identifier& name, const juce::var
     }
 }
 
+/**
+ * @brief Preserves unhandled vendor fields by cloning the original object and stripping parsed keys.
+ *
+ * Lossless round-tripping strategy:
+ * Any fields known and handled by OpenSV are stripped from the clone. What remains is serialized
+ * to JSON and saved in `preservedFieldsJson`. When saving, the preserved JSON is loaded back
+ * and merged with OpenSV's modified values, ensuring external editors do not lose their data.
+ */
 std::string preserve(const juce::var& original, std::initializer_list<const char*> fields)
 {
     auto extra = original.clone();
@@ -89,11 +129,17 @@ std::string preserve(const juce::var& original, std::initializer_list<const char
     return juce::JSON::toString(extra, true, std::numeric_limits<double>::max_digits10).toStdString();
 }
 
+/**
+ * @brief Returns true if a juce::var holds an integer or double numeric value.
+ */
 bool isNumber(const juce::var& value)
 {
     return value.isInt() || value.isInt64() || value.isDouble();
 }
 
+/**
+ * @brief Reads an integer Blick value from a JSON object with range validation.
+ */
 bool readInteger(const juce::var& object, const juce::Identifier& key, Blick& result)
 {
     const auto& value = object[key];
@@ -110,6 +156,9 @@ bool readInteger(const juce::var& object, const juce::Identifier& key, Blick& re
     return true;
 }
 
+/**
+ * @brief Reads a floating-point double from a JSON object with finite value validation.
+ */
 bool readNumber(const juce::var& object, const juce::Identifier& key, double& result)
 {
     const auto& value = object[key];
@@ -121,11 +170,17 @@ bool readNumber(const juce::var& object, const juce::Identifier& key, double& re
     return std::isfinite(result);
 }
 
+/**
+ * @brief Formats an error message indicating an invalid SVP file structure.
+ */
 juce::Result invalid(const juce::String& context)
 {
     return juce::Result::fail("Invalid Synthesizer V project: " + context);
 }
 
+/**
+ * @brief Deserializes pitch transition and vibrato parameters from a JSON object.
+ */
 juce::Result readPitchAttributes(const juce::var& value, PitchAttributes& attributes, const juce::String& context)
 {
     if (value.isVoid())
@@ -150,6 +205,7 @@ juce::Result readPitchAttributes(const juce::var& value, PitchAttributes& attrib
             extra.getDynamicObject()->removeProperty(field.name);
         }
     }
+    // Remove group reference vocal mode keys so they don't pollute attribute preserved JSON
     extra.getDynamicObject()->removeProperty("vocalModeInherited");
     extra.getDynamicObject()->removeProperty("vocalModePreset");
     extra.getDynamicObject()->removeProperty("vocalModeParams");
@@ -157,6 +213,15 @@ juce::Result readPitchAttributes(const juce::var& value, PitchAttributes& attrib
     return juce::Result::ok();
 }
 
+/**
+ * @brief Deserializes an automation ParameterCurve from JSON.
+ *
+ * In SVP files, curves are serialized as:
+ * {
+ *   "mode": "cubic" | "cosine" | "linear",
+ *   "points": [pos0, val0, pos1, val1, ...]  // Flat array of (position, value) pairs
+ * }
+ */
 juce::Result readCurve(const juce::var& value, ParameterCurve& curve, const juce::String& name)
 {
     if (value.isVoid())
@@ -197,6 +262,9 @@ juce::Result readCurve(const juce::var& value, ParameterCurve& curve, const juce
     return juce::Result::ok();
 }
 
+/**
+ * @brief Deserializes a NoteGroup JSON object (containing notes, parameters, vocal modes).
+ */
 juce::Result readGroup(const juce::var& value, NoteGroup& group)
 {
     if (!value.isObject() || !value["uuid"].isString() || value["uuid"].toString().isEmpty() || !value["notes"].isArray())
@@ -211,6 +279,8 @@ juce::Result readGroup(const juce::var& value, NoteGroup& group)
     parameters.getDynamicObject()->removeProperty("vibratoEnv");
     set(extra, "parameters", parameters);
     group.preservedFieldsJson = preserve(extra, {"uuid", "name", "notes", "vocalModes"});
+
+    // Parse note array
     for (const auto& item : *value["notes"].getArray())
     {
         Note note;
@@ -259,6 +329,8 @@ juce::Result readGroup(const juce::var& value, NoteGroup& group)
         note.preservedFieldsJson = preserve(item, {"onset", "duration", "pitch", "lyrics", "phonemes", "accent", "detune", "instantMode", "musicalType", "attributes", "systemAttributes"});
         group.notes.push_back(std::move(note));
     }
+
+    // Parse automation curves in parameters object
     if (const auto result = readCurve(value["parameters"]["pitchDelta"], group.pitchDelta, "pitchDelta"); result.failed())
     {
         return result;
@@ -267,6 +339,8 @@ juce::Result readGroup(const juce::var& value, NoteGroup& group)
     {
         return result;
     }
+
+    // Parse vocal mode curves / static amounts
     const auto& modes = value["vocalModes"];
     if (!modes.isVoid() && !modes.isObject())
     {
@@ -321,6 +395,9 @@ juce::Result readGroup(const juce::var& value, NoteGroup& group)
     return juce::Result::ok();
 }
 
+/**
+ * @brief Deserializes a GroupReference JSON object on a track timeline.
+ */
 juce::Result readReference(const juce::var& value, GroupReference& reference, const juce::File& directory)
 {
     Blick pitchOffset = 0;
@@ -339,6 +416,8 @@ juce::Result readReference(const juce::var& value, GroupReference& reference, co
         return invalid("a group reference ends before its beginning.");
     }
     reference.isInstrumental = static_cast<bool>(value["isInstrumental"]);
+
+    // Instrumental backing track audio file metadata
     const auto& audio = value["audio"];
     if (!audio.isVoid())
     {
@@ -352,6 +431,8 @@ juce::Result readReference(const juce::var& value, GroupReference& reference, co
             reference.audioFile = directory.getChildFile(filename).getFullPathName().toStdString();
         }
     }
+
+    // Track/reference level voice parameter overrides
     const auto& voice = value["voice"];
     if (!voice.isVoid() && !voice.isObject())
     {
@@ -404,6 +485,9 @@ juce::Result readReference(const juce::var& value, GroupReference& reference, co
     return juce::Result::ok();
 }
 
+/**
+ * @brief Deserializes a Track JSON object.
+ */
 juce::Result readTrack(const juce::var& value, Track& track, const juce::File& directory)
 {
     if (!value.isObject() || !value["groups"].isArray())
@@ -412,6 +496,8 @@ juce::Result readTrack(const juce::var& value, Track& track, const juce::File& d
     }
     track.name = value["name"].toString().toStdString();
     track.preservedFieldsJson = preserve(value, {"name", "mainGroup", "mainRef", "groups", "svVoice"});
+
+    // Voice database settings (Synthesizer V voice metadata)
     const auto& voice = value["svVoice"];
     if (!voice.isVoid())
     {
@@ -429,6 +515,8 @@ juce::Result readTrack(const juce::var& value, Track& track, const juce::File& d
             return invalid("svVoice has an unsupported language.");
         }
     }
+
+    // Parse track mainGroup and mainRef
     if (const auto result = readGroup(value["mainGroup"], track.mainGroup); result.failed())
     {
         return result;
@@ -441,6 +529,8 @@ juce::Result readTrack(const juce::var& value, Track& track, const juce::File& d
     {
         return invalid("a track's mainRef does not refer to its mainGroup.");
     }
+
+    // Mixer section (gain, pan, mute, solo)
     const auto& mixer = value["mixer"];
     double gainDecibel = 0.0;
     if (!mixer.isObject() || !readNumber(mixer, "gainDecibel", gainDecibel) || !readNumber(mixer, "pan", track.pan) || track.pan < -1.0 || track.pan > 1.0)
@@ -454,6 +544,8 @@ juce::Result readTrack(const juce::var& value, Track& track, const juce::File& d
     }
     track.mute = static_cast<bool>(mixer["mute"]);
     track.solo = static_cast<bool>(mixer["solo"]);
+
+    // Referenced groups on this track
     for (const auto& item : *value["groups"].getArray())
     {
         GroupReference reference;
@@ -466,6 +558,9 @@ juce::Result readTrack(const juce::var& value, Track& track, const juce::File& d
     return juce::Result::ok();
 }
 
+/**
+ * @brief Produces a default take list structure for SV note takes.
+ */
 juce::var defaultTakes()
 {
     auto take = makeObject();
@@ -478,6 +573,9 @@ juce::var defaultTakes()
     return value;
 }
 
+/**
+ * @brief Serializes PitchAttributes into a JSON object, preserving extra vendor fields.
+ */
 juce::var writePitchAttributes(const PitchAttributes& attributes)
 {
     auto value = retainedObject(attributes.preservedFieldsJson);
@@ -495,6 +593,9 @@ juce::var writePitchAttributes(const PitchAttributes& attributes)
     return value;
 }
 
+/**
+ * @brief Serializes an automation ParameterCurve into a JSON object.
+ */
 juce::var writeCurve(const ParameterCurve& curve)
 {
     auto value = retainedObject(curve.preservedFieldsJson);
@@ -509,6 +610,9 @@ juce::var writeCurve(const ParameterCurve& curve)
     return value;
 }
 
+/**
+ * @brief Serializes a NoteGroup into a JSON object.
+ */
 juce::var writeGroup(const NoteGroup& group)
 {
     auto value = retainedObject(group.preservedFieldsJson);
@@ -573,6 +677,9 @@ juce::var writeGroup(const NoteGroup& group)
     return value;
 }
 
+/**
+ * @brief Serializes a GroupReference into a JSON object.
+ */
 juce::var writeReference(const GroupReference& reference, const juce::File& directory)
 {
     auto value = retainedObject(reference.preservedFieldsJson);
@@ -613,6 +720,9 @@ juce::var writeReference(const GroupReference& reference, const juce::File& dire
     return value;
 }
 
+/**
+ * @brief Serializes a Track into a JSON object.
+ */
 juce::var writeTrack(const Track& track, int index, const juce::File& directory)
 {
     auto value = retainedObject(track.preservedFieldsJson);
@@ -655,6 +765,7 @@ juce::var writeTrack(const Track& track, int index, const juce::File& directory)
 
 juce::Result loadProjectFile(const juce::File& file, Project& project)
 {
+    // Validate file size limit
     if (file.getSize() > std::numeric_limits<int>::max())
     {
         return invalid("the file exceeds the supported size.");
@@ -670,6 +781,7 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
         return invalid("the file is empty.");
     }
     const auto* data = static_cast<const char*>(bytes.getData());
+    // Strip trailing NUL bytes commonly present in SV files
     while (size > 0 && data[size - 1] == '\0')
     {
         --size;
@@ -678,12 +790,16 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
     {
         return invalid("the JSON contains an embedded NUL or exceeds the supported size.");
     }
+
+    // Parse root JSON document
     juce::var root;
     const auto parsed = juce::JSON::parse(juce::String::fromUTF8(data, static_cast<int>(size)), root);
     if (parsed.failed())
     {
         return juce::Result::fail("Could not parse project JSON: " + parsed.getErrorMessage());
     }
+
+    // Verify format version 153 (Synthesizer V Studio 1.11.2)
     if (!root.isObject() || static_cast<int>(root["version"]) != projectFormatVersion)
     {
         return juce::Result::fail("Only Synthesizer V Studio 1.11.2 projects (format version 153) are supported.");
@@ -692,9 +808,12 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
     {
         return invalid("tracks, library, tempo, or meter is missing.");
     }
+
     Project loaded;
     loaded.name = file.getFileNameWithoutExtension().toStdString();
     loaded.preservedFieldsJson = preserve(root, {"tracks", "library"});
+
+    // Deserialize library groups
     for (const auto& value : *root["library"].getArray())
     {
         NoteGroup group;
@@ -704,6 +823,8 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
         }
         loaded.library.push_back(std::move(group));
     }
+
+    // Deserialize tracks
     for (const auto& value : *root["tracks"].getArray())
     {
         Track track;
@@ -713,6 +834,8 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
         }
         loaded.tracks.push_back(std::move(track));
     }
+
+    // Deserialize tempo markers
     loaded.tempoMap.tempos.clear();
     for (const auto& value : *root["time"]["tempo"].getArray())
     {
@@ -724,6 +847,8 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
         tempo.preservedFieldsJson = preserve(value, {"position", "bpm"});
         loaded.tempoMap.tempos.push_back(std::move(tempo));
     }
+
+    // Deserialize time signature markers
     loaded.tempoMap.timeSignatures.clear();
     for (const auto& value : *root["time"]["meter"].getArray())
     {
@@ -736,6 +861,8 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
         }
         loaded.tempoMap.timeSignatures.push_back({static_cast<int>(bar), static_cast<int>(numerator), static_cast<int>(denominator), preserve(value, {"index", "numerator", "denominator"})});
     }
+
+    // Validate unique group UUIDs across library and track main groups
     std::unordered_set<std::string> groupIds;
     for (const auto& group : loaded.library)
     {
@@ -751,6 +878,8 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
             return invalid("duplicate main group UUIDs.");
         }
     }
+
+    // Validate that all group references point to existing groups
     for (const auto& track : loaded.tracks)
     {
         for (const auto& reference : track.groups)
@@ -761,6 +890,7 @@ juce::Result loadProjectFile(const juce::File& file, Project& project)
             }
         }
     }
+
     normaliseProject(loaded);
     project = std::move(loaded);
     return juce::Result::ok();
@@ -770,6 +900,8 @@ juce::Result saveProjectFile(const juce::File& file, const Project& project)
 {
     auto root = retainedObject(project.preservedFieldsJson);
     set(root, "version", projectFormatVersion);
+
+    // Write tempo and meter timeline
     auto time = objectProperty(root, "time");
     juce::Array<juce::var> tempos;
     for (const auto& tempo : project.tempoMap.tempos)
@@ -780,6 +912,7 @@ juce::Result saveProjectFile(const juce::File& file, const Project& project)
         tempos.add(std::move(value));
     }
     set(time, "tempo", tempos);
+
     juce::Array<juce::var> meter;
     for (const auto& signature : project.tempoMap.timeSignatures)
     {
@@ -791,18 +924,24 @@ juce::Result saveProjectFile(const juce::File& file, const Project& project)
     }
     set(time, "meter", meter);
     set(root, "time", time);
+
+    // Write library groups
     juce::Array<juce::var> library;
     for (const auto& group : project.library)
     {
         library.add(writeGroup(group));
     }
     set(root, "library", library);
+
+    // Write tracks
     juce::Array<juce::var> tracks;
     for (std::size_t i = 0; i < project.tracks.size(); ++i)
     {
         tracks.add(writeTrack(project.tracks[i], static_cast<int>(i), file.getParentDirectory()));
     }
     set(root, "tracks", tracks);
+
+    // Write render configuration defaults
     auto render = objectProperty(root, "renderConfig");
     setDefault(render, "destination", "");
     setDefault(render, "filename", utf8(project.name));
@@ -813,7 +952,11 @@ juce::Result saveProjectFile(const juce::File& file, const Project& project)
     setDefault(render, "exportMixDown", true);
     setDefault(render, "exportPitch", false);
     set(root, "renderConfig", render);
+
     const auto json = juce::JSON::toString(root, false, std::numeric_limits<double>::max_digits10);
+
+    // Write atomically via a temporary file: writes to temp, then renames over original.
+    // This prevents file corruption if the process or machine terminates mid-write.
     juce::TemporaryFile temporary(file);
     {
         auto output = temporary.getFile().createOutputStream();
@@ -833,4 +976,5 @@ juce::Result saveProjectFile(const juce::File& file, const Project& project)
     }
     return juce::Result::ok();
 }
+
 } // namespace sv

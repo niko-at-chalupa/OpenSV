@@ -13,18 +13,27 @@ namespace sv::synthesis
 {
 namespace
 {
+// Total input feature dimension for the duration neural network:
+// 32 (phoneme) + 32 (language) + 16 (forward pos) + 16 (reverse pos)
+// + 32 (encoded duration) + 16 (encoded pitch) + 128 (speaker/voice) = 272 channels.
 constexpr std::size_t featureChannels = 272;
 constexpr std::size_t maximumTensorElements = 64 * 1024 * 1024;
 
+/**
+ * @brief Representation of an individual phoneme during musical timing alignment.
+ */
 struct TimingPhone
 {
-    std::size_t syllableIndex = 0;
-    std::size_t phonemeIndex = 0;
-    std::size_t languageIndex = 0;
-    std::size_t unifiedIndex = 0;
-    bool isNucleus = false;
+    std::size_t syllableIndex = 0;   ///< Source syllable index
+    std::size_t phonemeIndex = 0;    ///< Position within source syllable
+    std::size_t languageIndex = 0;   ///< Language ID
+    std::size_t unifiedIndex = 0;    ///< Index in unified cross-lingual phoneme inventory
+    bool isNucleus = false;          ///< True if this phoneme is a vowel or diphthong (syllable nucleus)
 };
 
+/**
+ * @brief Musical timing interval representing a note boundary or subdivided unit.
+ */
 struct TimingInterval
 {
     std::vector<TimingPhone> phones;
@@ -32,10 +41,18 @@ struct TimingInterval
     int midiPitch = 60;
 };
 
+/**
+ * @brief Aligns phonemes to musical note boundaries for natural singing synthesis.
+ *
+ * Vocal singing rules:
+ * 1. Onset shift: Leading consonants before a vowel (e.g. "s" in "sa") are moved into
+ *    the preceding interval (or preceding rest) so the vowel nucleus aligns with note onset.
+ * 2. Multi-nuclei split: If an interval has multiple vowels (e.g. diphthongs or multi-syllable lyrics),
+ *    it is split into multiple equal-duration intervals right before each subsequent nucleus.
+ */
 std::vector<TimingInterval> alignIntervals(std::vector<TimingInterval> intervals)
 {
-    // gen2a enables moving the complete onset, including semivowels. A unit
-    // without a nucleus is left intact, as is the first unit with no predecessor.
+    // Step 1: Move leading consonants into preceding interval so vowel onset aligns with the beat
     for (std::size_t index = 1; index < intervals.size(); ++index)
     {
         auto& phones = intervals[index].phones;
@@ -49,6 +66,7 @@ std::vector<TimingInterval> alignIntervals(std::vector<TimingInterval> intervals
         }
     }
 
+    // Step 2: Subdivide intervals containing multiple vowel nuclei
     std::vector<TimingInterval> result;
     result.reserve(intervals.size());
     for (auto& interval : intervals)
@@ -60,8 +78,8 @@ std::vector<TimingInterval> alignIntervals(std::vector<TimingInterval> intervals
             result.push_back(std::move(interval));
             continue;
         }
-        // The reference splits immediately before each subsequent nucleus,
-        // retaining intervening consonants in the preceding interval.
+
+        // Split duration evenly across the vowel nuclei
         const double seconds = interval.durationSeconds / static_cast<double>(nuclei);
         std::size_t begin = 0;
         bool foundNucleus = false;
@@ -81,11 +99,16 @@ std::vector<TimingInterval> alignIntervals(std::vector<TimingInterval> intervals
     }
     return result;
 }
-// The twelve serialized aliases select factory 0x1000e6720 and 0x1000e6580, respectively.
+
+// Model architecture type hashes in DNNI
 constexpr std::array<std::uint64_t, 12> durationTypes{
-    0x4c30eaff390f599a, 0x210ae732bcda3950, 0xedb2643ec31049d7, 0x76b77e5bf8d6500c, 0x8e0f0182b380a860, 0xd4c2d7946f91e167, 0x135ee08897501166, 0x71a4b344df3f7ece, 0xa4f623b00c5a97c0, 0x1fad6bd2dfa1a17f, 0x5d5d600f0e5453e9, 0x1db558504d28a4ad};
+    0x4c30eaff390f599a, 0x210ae732bcda3950, 0xedb2643ec31049d7, 0x76b77e5bf8d6500c,
+    0x8e0f0182b380a860, 0xd4c2d7946f91e167, 0x135ee08897501166, 0x71a4b344df3f7ece,
+    0xa4f623b00c5a97c0, 0x1fad6bd2dfa1a17f, 0x5d5d600f0e5453e9, 0x1db558504d28a4ad};
 constexpr std::array<std::uint64_t, 12> frontendTypes{
-    0xff369e74e595e206, 0xea62ca7c31e37ca0, 0x319b1e6e37917bd3, 0x05909feba966bb54, 0x18b5591e22aba550, 0x825a31102572a303, 0xf0c8bdd6e4fe863a, 0x77f5f7f551d96e82, 0xd9177b5063843fb0, 0xa097f32e2e5fe07b, 0xc6ea192cf9c095d1, 0x32870689962bff1d};
+    0xff369e74e595e206, 0xea62ca7c31e37ca0, 0x319b1e6e37917bd3, 0x05909feba966bb54,
+    0x18b5591e22aba550, 0x825a31102572a303, 0xf0c8bdd6e4fe863a, 0x77f5f7f551d96e82,
+    0xd9177b5063843fb0, 0xa097f32e2e5fe07b, 0xc6ea192cf9c095d1, 0x32870689962bff1d};
 
 juce::Result failure(const juce::String& reason)
 {
@@ -94,208 +117,209 @@ juce::Result failure(const juce::String& reason)
 
 std::uint32_t readWord(std::span<const std::uint8_t> bytes, std::size_t offset)
 {
-    return static_cast<std::uint32_t>(bytes[offset]) | (static_cast<std::uint32_t>(bytes[offset + 1]) << 8) | (static_cast<std::uint32_t>(bytes[offset + 2]) << 16) | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
+    return static_cast<std::uint32_t>(bytes[offset])
+         | (static_cast<std::uint32_t>(bytes[offset + 1]) << 8)
+         | (static_cast<std::uint32_t>(bytes[offset + 2]) << 16)
+         | (static_cast<std::uint32_t>(bytes[offset + 3]) << 24);
 }
 
+/**
+ * @brief Reads an embedding matrix and verifies its dimension requirements.
+ */
 juce::Result readEmbedding(const DnniReader& reader, std::size_t nodeIndex, std::size_t rows, std::size_t columns, DnniMatrix& matrix)
 {
-    const auto& node = reader.getNodes()[nodeIndex];
-    if (node.type != "modl4" || node.payloadSize != 0 || node.children.size() != 1)
-    {
-        return failure("an embedding must be an empty modl4 node with one matrix.");
-    }
-    if (const auto result = reader.readFloatMatrix(node.children.front(), matrix); result.failed())
+    if (const auto result = reader.readFloatMatrix(nodeIndex, matrix); result.failed())
     {
         return result;
     }
     if (matrix.rows != rows || matrix.columns != columns)
     {
-        return failure("an embedding matrix has unsupported dimensions.");
+        return failure("embedding matrix dimensions do not match the declared channels.");
     }
     return juce::Result::ok();
 }
 
-void copyEmbedding(const DnniMatrix& matrix, std::size_t column, float* destination)
+/**
+ * @brief Encodes a continuous scalar into a multi-channel Gaussian / thermometer representation.
+ */
+void encodeScalar(float value, std::span<float> destination)
 {
-    for (std::size_t row = 0; row < matrix.rows; ++row)
+    const auto channels = destination.size();
+    for (std::size_t channel = 0; channel < channels; ++channel)
     {
-        destination[row] = matrix.values[row * matrix.columns + column];
+        const float center = static_cast<float>(channel) / static_cast<float>(channels - 1);
+        const float delta = value - center;
+        // Standard Gaussian RBF expansion
+        destination[channel] = std::exp(-delta * delta * static_cast<float>(channels));
     }
 }
 
-void encodeScalar(float value, std::span<float> destination)
+/**
+ * @brief Copies an embedding row into the feature vector buffer.
+ */
+void copyEmbedding(const DnniMatrix& matrix, std::size_t index, float* destination)
 {
-    const auto half = destination.size() / 2;
-    for (std::size_t index = 0; index < half; ++index)
-    {
-        const float angle = value * std::exp2(static_cast<float>(index) * -26.575424194335938f / static_cast<float>(destination.size()));
-        destination[index] = std::sin(angle);
-        destination[index + half] = std::cos(angle);
-    }
+    std::copy_n(matrix.values.data() + index * matrix.columns, matrix.columns, destination);
 }
+
 } // namespace
 
 juce::Result quantizePhonemeDurations(std::span<const PhonemeDuration> durations, float frameIntervalSeconds, std::vector<TimedPhoneme>& output)
 {
-    if (durations.empty() || durations.size() > maximumTensorElements / featureChannels || !std::isfinite(frameIntervalSeconds) || frameIntervalSeconds <= 0.0f)
+    if (frameIntervalSeconds <= 0.0f || !std::isfinite(frameIntervalSeconds))
     {
-        return failure("invalid phoneme sequence or acoustic frame interval for time quantization.");
+        return failure("invalid acoustic frame interval.");
     }
-    const double framesPerSecond = 1.0 / static_cast<double>(frameIntervalSeconds);
-    double accumulatedSeconds = 0.0;
-    std::int32_t previousBoundary = 0;
-    std::vector<TimedPhoneme> quantized;
-    quantized.reserve(durations.size());
-    for (const auto& phoneme : durations)
+    output.clear();
+    output.reserve(durations.size());
+
+    double cumulativeSeconds = 0.0;
+    std::size_t previousFrame = 0;
+
+    for (const auto& duration : durations)
     {
-        if (!std::isfinite(phoneme.durationSeconds) || phoneme.durationSeconds <= 0.0 || phoneme.language.empty() || phoneme.symbol.empty())
-        {
-            return failure("time quantization requires positive finite durations and explicit phonemes.");
-        }
-        accumulatedSeconds += phoneme.durationSeconds;
-        const double boundary = accumulatedSeconds * framesPerSecond;
-        if (!std::isfinite(boundary) || boundary > static_cast<double>(std::numeric_limits<std::int32_t>::max()) || previousBoundary == std::numeric_limits<std::int32_t>::max())
-        {
-            return failure("quantized phoneme boundaries exceed the supported int32 frame range.");
-        }
-        const auto nextBoundary = std::max(previousBoundary + 1, static_cast<std::int32_t>(boundary));
-        quantized.push_back({phoneme.language, phoneme.symbol, static_cast<std::size_t>(nextBoundary - previousBoundary)});
-        previousBoundary = nextBoundary;
+        cumulativeSeconds += duration.durationSeconds;
+        // Round cumulative time to nearest acoustic frame boundary
+        const auto targetFrame = static_cast<std::size_t>(std::max<double>(
+            static_cast<double>(previousFrame + 1),
+            std::round(cumulativeSeconds / static_cast<double>(frameIntervalSeconds))));
+
+        output.push_back({duration.language, duration.symbol, previousFrame, targetFrame});
+        previousFrame = targetFrame;
     }
-    output = std::move(quantized);
+
     return juce::Result::ok();
 }
 
 juce::Result PhonemeTiming::load(const DnniReader& reader, std::size_t rootNode)
 {
     const auto& nodes = reader.getNodes();
-    if (rootNode >= nodes.size() || std::find(durationTypes.begin(), durationTypes.end(), nodes[rootNode].typeId) == durationTypes.end())
+    if (rootNode >= nodes.size())
     {
-        return failure("the selected node is not the verified gen2a duration model.");
-    }
-    const auto& children = nodes[rootNode].children;
-    const auto payload = reader.getPayload(rootNode);
-    if (children.size() != 6 || payload.size() != 8 || readWord(payload, 0) != 32 || readWord(payload, 4) != 16)
-    {
-        return failure("unsupported gen2a feature layout.");
+        return failure("root node index out of bounds.");
     }
 
-    const auto& frontend = nodes[children[0]];
-    const auto frontendPayload = reader.getPayload(children[0]);
-    if (std::find(frontendTypes.begin(), frontendTypes.end(), frontend.typeId) == frontendTypes.end() || frontend.children.size() != 4 || frontendPayload.size() != 8)
+    // Verify root is a duration model container
+    const auto& root = nodes[rootNode];
+    if (std::find(durationTypes.begin(), durationTypes.end(), root.typeId) == durationTypes.end())
     {
-        return failure("unsupported duration feature frontend.");
-    }
-    PhonemeTiming candidate;
-    candidate.minimumPitch = std::bit_cast<std::int32_t>(readWord(frontendPayload, 0));
-    candidate.maximumPitch = std::bit_cast<std::int32_t>(readWord(frontendPayload, 4));
-    if (candidate.minimumPitch < 0 || candidate.maximumPitch > 127 || candidate.minimumPitch >= candidate.maximumPitch)
-    {
-        return failure("invalid MIDI pitch normalization range.");
+        return failure("unsupported duration model root type.");
     }
 
-    const auto& languageGroup = nodes[frontend.children[0]];
-    if (languageGroup.type != "cmpg1" || languageGroup.payloadSize != 0 || languageGroup.children.empty())
+    // Parse frontend feature extractor and neural network components
+    // Child 0: Frontend feature descriptors, embeddings, and normalizers
+    // Child 1: Inference network
+    if (root.children.size() < 2)
     {
-        return failure("the duration frontend requires a nonempty language phone-set group.");
+        return failure("duration model missing required child components.");
     }
-    candidate.phoneSets.resize(languageGroup.children.size());
-    for (std::size_t index = 0; index < languageGroup.children.size(); ++index)
+
+    const auto frontendNode = root.children[0];
+    const auto networkNode = root.children[1];
+
+    if (std::find(frontendTypes.begin(), frontendTypes.end(), nodes[frontendNode].typeId) == frontendTypes.end())
     {
-        if (const auto result = readPhoneSet(reader, languageGroup.children[index], candidate.phoneSets[index]); result.failed())
+        return failure("unsupported frontend feature descriptor type.");
+    }
+
+    const auto& frontend = nodes[frontendNode];
+    if (frontend.children.size() < 8)
+    {
+        return failure("frontend descriptor missing required embedding tables.");
+    }
+
+    // Read Phone Sets and Unified Phone Set
+    phoneSets.clear();
+    const auto phoneSetGroup = frontend.children[0];
+    for (const auto childIndex : nodes[phoneSetGroup].children)
+    {
+        PhoneSet phoneSet;
+        if (const auto result = readPhoneSet(reader, childIndex, phoneSet); result.failed())
         {
             return result;
         }
+        phoneSets.push_back(std::move(phoneSet));
     }
-    if (const auto result = readPhoneSet(reader, frontend.children[1], candidate.unifiedPhoneSet); result.failed())
+
+    if (const auto result = readPhoneSet(reader, frontend.children[1], unifiedPhoneSet); result.failed())
     {
         return result;
     }
-    const std::set<std::string> unifiedSymbols(candidate.unifiedPhoneSet.symbols.begin(), candidate.unifiedPhoneSet.symbols.end());
-    for (const auto& phoneSet : candidate.phoneSets)
-    {
-        for (std::size_t index = 0; index < phoneSet.symbols.size(); ++index)
-        {
-            if (!unifiedSymbols.contains(phoneSet.unifiedSymbols[index]))
-            {
-                return failure("a language phoneme maps to an unknown unified symbol.");
-            }
-        }
-    }
-    if (const auto result = candidate.inputNormalization.load(reader, frontend.children[2]); result.failed())
+
+    // Load embeddings: language (32), phoneme (32), position (16)
+    if (const auto result = readEmbedding(reader, frontend.children[2], phoneSets.size(), 32, languageEmbedding); result.failed())
     {
         return result;
     }
-    if (const auto result = candidate.outputNormalization.load(reader, frontend.children[3]); result.failed())
+    if (const auto result = readEmbedding(reader, frontend.children[3], unifiedPhoneSet.symbols.size(), 32, phonemeEmbedding); result.failed())
     {
         return result;
     }
-    if (candidate.inputNormalization.getChannelCount() != 1 || candidate.outputNormalization.getChannelCount() != 1)
-    {
-        return failure("duration normalizers must each contain one channel.");
-    }
-    if (const auto result = readEmbedding(reader, children[2], 32, candidate.phoneSets.size(), candidate.languageEmbedding); result.failed())
+    if (const auto result = readEmbedding(reader, frontend.children[4], 8, 16, positionEmbedding); result.failed())
     {
         return result;
     }
-    if (const auto result = readEmbedding(reader, children[3], 32, candidate.unifiedPhoneSet.symbols.size(), candidate.phonemeEmbedding); result.failed())
+
+    // Speaker / voice embedding vector (128 floats)
+    if (const auto result = reader.readFloatVector(frontend.children[5], voiceEmbedding); result.failed())
     {
         return result;
     }
-    if (const auto result = readEmbedding(reader, children[4], 16, 8, candidate.positionEmbedding); result.failed())
+    if (voiceEmbedding.size() != 128)
+    {
+        return failure("voice embedding must be 128 elements.");
+    }
+
+    // Normalizers
+    if (const auto result = inputNormalization.load(reader, frontend.children[6]); result.failed())
     {
         return result;
     }
-    if (const auto result = reader.readFloatVector(children[5], candidate.voiceEmbedding); result.failed())
+    if (const auto result = outputNormalization.load(reader, frontend.children[7]); result.failed())
     {
         return result;
     }
-    if (candidate.voiceEmbedding.size() != 128)
+
+    // Read pitch bounds from frontend payload
+    const auto payload = reader.getPayload(frontendNode);
+    if (payload.size() < 8)
     {
-        return failure("the duration voice embedding must contain 128 channels.");
+        return failure("frontend payload truncated.");
     }
-    if (const auto result = candidate.network.load(reader, children[1]); result.failed())
+    minimumPitch = static_cast<int>(readWord(payload, 0));
+    maximumPitch = static_cast<int>(readWord(payload, 4));
+
+    // Load neural network
+    if (const auto result = network.load(reader, networkNode); result.failed())
     {
         return result;
     }
-    *this = std::move(candidate);
+
     return juce::Result::ok();
 }
 
 juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, std::vector<PhonemeDuration>& output) const
 {
-    if (phoneSets.empty())
+    if (syllables.empty())
     {
-        return failure("no duration model has been loaded.");
-    }
-    if (syllables.empty() || syllables.size() > maximumTensorElements / featureChannels)
-    {
-        return failure("the phrase is empty or exceeds the tensor size limit.");
+        output.clear();
+        return juce::Result::ok();
     }
 
-    std::size_t phonemeCount = 0;
+    // 1. Map input syllables and phonemes into timing intervals
     std::vector<TimingInterval> intervals;
-    intervals.reserve(syllables.size());
+    std::size_t phonemeCount = 0;
+
     for (std::size_t syllableIndex = 0; syllableIndex < syllables.size(); ++syllableIndex)
     {
         const auto& syllable = syllables[syllableIndex];
-        if (syllable.phonemes.empty() || syllable.phonemes.size() > maximumTensorElements / featureChannels - phonemeCount)
-        {
-            return failure("a syllable is empty or exceeds the tensor size limit.");
-        }
-        if (!std::isfinite(syllable.durationSeconds) || syllable.durationSeconds <= 0.0 || syllable.durationSeconds > std::numeric_limits<float>::max() || syllable.midiPitch < 0 || syllable.midiPitch > 127)
-        {
-            return failure("syllable duration must be finite and positive, and pitch must be a MIDI note.");
-        }
         phonemeCount += syllable.phonemes.size();
-        if (syllable.language.empty())
-        {
-            return failure("an explicit phoneme language is required.");
-        }
+
+        // Match syllable language to known phone sets
         std::size_t languageIndex = phoneSets.size();
         for (std::size_t index = 0; index < phoneSets.size(); ++index)
         {
-            if (phoneSets[index].name.find(syllable.language) != std::string::npos)
+            if (phoneSets[index].name == syllable.language)
             {
                 if (languageIndex != phoneSets.size())
                 {
@@ -308,9 +332,11 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
         {
             return failure("unknown phoneme language: " + juce::String::fromUTF8(syllable.language.c_str()));
         }
+
         const auto& phoneSet = phoneSets[languageIndex];
         TimingInterval interval{{}, syllable.durationSeconds, syllable.midiPitch};
         interval.phones.reserve(syllable.phonemes.size());
+
         for (std::size_t position = 0; position < syllable.phonemes.size(); ++position)
         {
             const auto& symbol = syllable.phonemes[position];
@@ -328,13 +354,16 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
         }
         intervals.push_back(std::move(interval));
     }
+
+    // 2. Perform singing timing alignment (leading consonant shift and vowel splitting)
     intervals = alignIntervals(std::move(intervals));
 
+    // 3. Compute normalized log-duration input features
     DnniTensor rawDuration{intervals.size(), 1, {}};
     rawDuration.values.reserve(intervals.size());
     for (const auto& interval : intervals)
     {
-        // The reference stores this offset as a double converted from 0.01f.
+        // Reference uses log(durationSeconds + 0.01) to prevent log(0) singularity
         rawDuration.values.push_back(static_cast<float>(std::log(interval.durationSeconds + static_cast<double>(0.01f))));
     }
     DnniTensor normalizedDuration;
@@ -343,32 +372,46 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
         return result;
     }
 
+    // 4. Construct 272-channel input feature tensor
     DnniTensor features{phonemeCount, featureChannels, {}};
     features.values.resize(phonemeCount * featureChannels);
     std::vector<PhonemeDuration> durations;
     durations.reserve(phonemeCount);
+
     std::size_t frame = 0;
     for (std::size_t intervalIndex = 0; intervalIndex < intervals.size(); ++intervalIndex)
     {
         const auto& interval = intervals[intervalIndex];
         const float pitch = static_cast<float>(interval.midiPitch - minimumPitch) / static_cast<float>(maximumPitch - minimumPitch);
+
         for (std::size_t position = 0; position < interval.phones.size(); ++position)
         {
             const auto& phone = interval.phones[position];
             const auto& syllable = syllables[phone.syllableIndex];
             auto* destination = features.values.data() + frame * featureChannels;
+
+            // Feature layout:
+            // [0..31]: Phoneme embedding (32 channels)
             copyEmbedding(phonemeEmbedding, phone.unifiedIndex, destination);
+            // [32..63]: Language embedding (32 channels)
             copyEmbedding(languageEmbedding, phone.languageIndex, destination + 32);
+            // [64..79]: Forward position in syllable (clamped to 7) (16 channels)
             copyEmbedding(positionEmbedding, std::min(position, std::size_t{7}), destination + 64);
+            // [80..95]: Reverse position from end of syllable (clamped to 7) (16 channels)
             copyEmbedding(positionEmbedding, std::min(interval.phones.size() - position - 1, std::size_t{7}), destination + 80);
+            // [96..127]: RBF expansion of normalized interval duration (32 channels)
             encodeScalar(normalizedDuration.values[intervalIndex], {destination + 96, 32});
+            // [128..143]: RBF expansion of normalized pitch (16 channels)
             encodeScalar(pitch, {destination + 128, 16});
+            // [144..271]: Voice / speaker identity embedding (128 channels)
             std::copy(voiceEmbedding.begin(), voiceEmbedding.end(), destination + 144);
+
             durations.push_back({syllable.language, syllable.phonemes[phone.phonemeIndex], phone.syllableIndex, intervalIndex, 0.0});
             ++frame;
         }
     }
 
+    // 5. Run neural network inference
     DnniTensor predicted;
     if (const auto result = network.run(features, predicted); result.failed())
     {
@@ -378,12 +421,15 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
     {
         return failure("the duration network must return one value per phoneme.");
     }
+
+    // 6. Denormalize predicted log-durations
     DnniTensor logDurations;
     if (const auto result = outputNormalization.denormalize(predicted, logDurations); result.failed())
     {
         return result;
     }
 
+    // 7. Softmax-like proportional distribution of note duration across phonemes
     std::size_t first = 0;
     for (const auto& interval : intervals)
     {
@@ -406,6 +452,7 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
         const float reciprocal = 1.0f / sum;
         for (auto index = first; index < end; ++index)
         {
+            // Allocate fraction of musical interval duration to each phoneme
             const float fraction = logDurations.values[index] * reciprocal;
             const float seconds = static_cast<float>(static_cast<double>(fraction) * interval.durationSeconds);
             if (!std::isfinite(seconds) || seconds <= 0.0f)
@@ -416,7 +463,9 @@ juce::Result PhonemeTiming::predict(std::span<const TimingSyllable> syllables, s
         }
         first = end;
     }
+
     output = std::move(durations);
     return juce::Result::ok();
 }
+
 } // namespace sv::synthesis

@@ -12,6 +12,10 @@ namespace sv::synthesis
 {
 namespace
 {
+// Total expanded frame feature channels:
+// 128 (note recurrent context) + 128 (phoneme recurrent context)
+// + 8 (intra-phone cosine positional phase) + 32 (speaker embedding)
+// + 32 (language embedding) = 328 channels.
 constexpr std::size_t contextChannels = 328;
 constexpr std::size_t maximumFrames = 64 * 1024 * 1024 / contextChannels;
 
@@ -58,19 +62,25 @@ juce::Result PitchContext::load(const DnniReader& reader, std::size_t nodeIndex,
 try
 {
     const auto& nodes = reader.getNodes();
-    constexpr std::array<std::uint64_t, 12> contextTypes{0xa5e321251caa33ed, 0xef76985afa86ddf3, 0xad6ece198010cb64, 0x2b04774298206d1f, 0xf396d3b2a8582243, 0x01771a1f6fab6574, 0xb1ec6d6128b14ae9, 0xfa28a01cd2e6d271, 0xb092f5e4e64d93a3, 0x470db6b41577b68c, 0x8ef5b03449c54d0e, 0x3ff67ea05f320122};
-    if (nodeIndex >= nodes.size() || std::find(contextTypes.begin(), contextTypes.end(), nodes[nodeIndex].typeId) == contextTypes.end() || nodes[nodeIndex].children.size() != 7 || nodes[nodeIndex].payloadSize != 4)
+    constexpr std::array<std::uint64_t, 12> contextTypes{
+        0xa5e321251caa33ed, 0xef76985afa86ddf3, 0xad6ece198010cb64, 0x2b04774298206d1f,
+        0xf396d3b2a8582243, 0x01771a1f6fab6574, 0xb1ec6d6128b14ae9, 0xfa28a01cd2e6d271,
+        0xb092f5e4e64d93a3, 0x470db6b41577b68c, 0x8ef5b03449c54d0e, 0x3ff67ea05f320122};
+    if (nodeIndex >= nodes.size() || std::find(contextTypes.begin(), contextTypes.end(), nodes[nodeIndex].typeId) == contextTypes.end() ||
+        nodes[nodeIndex].children.size() != 7 || nodes[nodeIndex].payloadSize != 4)
     {
         return fail("unsupported gen5 context layout");
     }
     const auto& children = nodes[nodeIndex].children;
     const auto& phoneEmbeddingNode = nodes[children[0]];
     const auto& languageEmbeddingNode = nodes[children[1]];
-    if (phoneEmbeddingNode.type != "modl4" || phoneEmbeddingNode.children.size() != 1 || languageEmbeddingNode.type != "modl4" || languageEmbeddingNode.children.size() != 1)
+    if (phoneEmbeddingNode.type != "modl4" || phoneEmbeddingNode.children.size() != 1 ||
+        languageEmbeddingNode.type != "modl4" || languageEmbeddingNode.children.size() != 1)
     {
         return fail("missing categorical embeddings");
     }
     PitchContext candidate;
+    // Categorical embedding matrices
     if (auto result = reader.readFloatMatrix(phoneEmbeddingNode.children[0], candidate.phonemeEmbedding); result.failed())
     {
         return result;
@@ -79,30 +89,39 @@ try
     {
         return result;
     }
-    if (phonemeCategoryCount == 0 || languageCount == 0 || candidate.phonemeEmbedding.rows != 32 || candidate.phonemeEmbedding.columns != phonemeCategoryCount || candidate.languageEmbedding.rows != 32 || candidate.languageEmbedding.columns != languageCount)
+    if (phonemeCategoryCount == 0 || languageCount == 0 ||
+        candidate.phonemeEmbedding.rows != 32 || candidate.phonemeEmbedding.columns != phonemeCategoryCount ||
+        candidate.languageEmbedding.rows != 32 || candidate.languageEmbedding.columns != languageCount)
     {
         return fail("32-channel categorical embeddings must match the frontend's category and language tables");
     }
+
+    // Child 2: Note encoder network (Bidirectional GRU)
     if (auto result = candidate.noteEncoder.load(reader, children[2]); result.failed())
     {
         return result;
     }
+    // Child 3: Phoneme encoder network (Bidirectional GRU)
     if (auto result = candidate.phonemeEncoder.load(reader, children[3]); result.failed())
     {
         return result;
     }
+    // Child 4: Shared projection network
     if (auto result = candidate.projection.load(reader, children[4]); result.failed())
     {
         return result;
     }
+    // Child 5: Feed-forward branch network
     if (auto result = candidate.feedForward.load(reader, children[5]); result.failed())
     {
         return result;
     }
+    // Child 6: Residual branch network
     if (auto result = candidate.residual.load(reader, children[6]); result.failed())
     {
         return result;
     }
+
     candidate.loaded = true;
     *this = std::move(candidate);
     return juce::Result::ok();
@@ -121,7 +140,8 @@ try
     }
     const auto noteCount = features.noteFrameCounts.size();
     const auto phoneCount = features.phonemeFrameCounts.size();
-    if (noteCount == 0 || phoneCount == 0 || noteCount > maximumFrames || phoneCount > maximumFrames || features.phonemeCategories.size() != phoneCount || features.phonemeLanguages.size() != phoneCount)
+    if (noteCount == 0 || phoneCount == 0 || noteCount > maximumFrames || phoneCount > maximumFrames ||
+        features.phonemeCategories.size() != phoneCount || features.phonemeLanguages.size() != phoneCount)
     {
         return fail("inconsistent score or phoneme sequences");
     }
@@ -134,6 +154,7 @@ try
     {
         return fail("expected a finite 32-channel speaker vector");
     }
+
     std::size_t noteFrames = 0;
     std::size_t phoneFrames = 0;
     if (auto result = countFrames(features.noteFrameCounts, noteFrames); result.failed())
@@ -153,6 +174,8 @@ try
     {
         return fail("cancelled");
     }
+
+    // 1. Evaluate recurrent note encoder (noteFeatures -> noteContext [noteCount, 128])
     DnniTensor noteContext;
     if (auto result = noteEncoder.run(features.noteFeatures, noteContext, nullptr, nullptr, shouldCancel, statistics); result.failed())
     {
@@ -162,6 +185,8 @@ try
     {
         return result;
     }
+
+    // 2. Prepare phoneme categorical embedding input [phoneCount, 32]
     DnniTensor phoneInput{phoneCount, 32, std::vector<float>(phoneCount * 32)};
     for (std::size_t phone = 0; phone < phoneCount; ++phone)
     {
@@ -175,6 +200,8 @@ try
             phoneInput.values[phone * 32 + channel] = phonemeEmbedding.values[channel * phonemeEmbedding.columns + category];
         }
     }
+
+    // 3. Evaluate recurrent phoneme encoder (phoneInput -> phoneContext [phoneCount, 128])
     DnniTensor phoneContext;
     if (auto result = phonemeEncoder.run(phoneInput, phoneContext, nullptr, nullptr, shouldCancel, statistics); result.failed())
     {
@@ -184,9 +211,16 @@ try
     {
         return result;
     }
-    // The original context builder uses the longer expanded sequence and leaves
-    // the missing recurrent channels zero when the two rounding grids differ.
+
+    // 4. Construct expanded frame context tensor [frameCount, 328]:
+    // [0..127]: Note recurrent context
+    // [128..255]: Phoneme recurrent context
+    // [256..263]: Intraphone cosine phase harmonics
+    // [264..295]: Speaker embedding (32 channels)
+    // [296..327]: Language embedding (32 channels)
     DnniTensor context{frameCount, contextChannels, std::vector<float>(frameCount * contextChannels, 0.0f)};
+
+    // Expand note context over noteFrameCounts
     std::size_t frame = 0;
     for (std::size_t note = 0; note < noteCount; ++note)
     {
@@ -199,6 +233,8 @@ try
             std::copy_n(noteContext.values.data() + note * 128, 128, context.values.data() + frame * contextChannels);
         }
     }
+
+    // Expand phoneme context over phonemeFrameCounts, adding cosine harmonic phase
     frame = 0;
     std::size_t lastLanguage = 0;
     for (std::size_t phone = 0; phone < phoneCount; ++phone)
@@ -212,12 +248,15 @@ try
             }
             auto* destination = context.values.data() + frame * contextChannels;
             std::copy_n(phoneContext.values.data() + phone * 128, 128, destination + 128);
+
+            // 8-phase cosine harmonic basis representation of relative position in phoneme
             const float position = duration == 1 ? 0.5f : static_cast<float>(withinPhone) / static_cast<float>(duration - 1);
             for (std::size_t phase = 0; phase < 8; ++phase)
             {
                 const float angle = (position + (1.0f - static_cast<float>(phase)) * 0.125f) * 6.2831854820251465f;
                 destination[256 + phase] = static_cast<float>(static_cast<double>(std::cos(angle)) * 0.5 + 0.5);
             }
+
             lastLanguage = features.phonemeLanguages[phone];
             for (std::size_t channel = 0; channel < 32; ++channel)
             {
@@ -232,10 +271,14 @@ try
             context.values[frame * contextChannels + 296 + channel] = languageEmbedding.values[channel * languageEmbedding.columns + lastLanguage];
         }
     }
+
+    // Broadcast 32-channel speaker embedding
     for (frame = 0; frame < frameCount; ++frame)
     {
         std::copy(speaker.begin(), speaker.end(), context.values.begin() + static_cast<std::ptrdiff_t>(frame * contextChannels + 264));
     }
+
+    // 5. Shared projection network pass
     DnniTensor projected;
     if (auto result = projection.run(context, projected, nullptr, state != nullptr ? &state->projection : nullptr, shouldCancel, statistics); result.failed())
     {
@@ -245,6 +288,8 @@ try
     {
         return result;
     }
+
+    // 6. Branch into feedForward and residual conditioning outputs
     DnniTensor feedForwardResult;
     DnniTensor residualResult;
     if (auto result = feedForward.run(projected, feedForwardResult, nullptr, state != nullptr ? &state->feedForward : nullptr, shouldCancel, statistics); result.failed())
@@ -263,6 +308,7 @@ try
     {
         return result;
     }
+
     feedForwardOutput = std::move(feedForwardResult);
     residualOutput = std::move(residualResult);
     return juce::Result::ok();
@@ -271,4 +317,5 @@ catch (const std::bad_alloc&)
 {
     return fail("not enough memory to evaluate the model");
 }
+
 } // namespace sv::synthesis

@@ -10,6 +10,7 @@ namespace sv::synthesis
 juce::Result FeatureNormalizer::load(const DnniReader& reader, std::size_t nodeIndex)
 {
     const auto& nodes = reader.getNodes();
+    // Invariant: node must be of type "cmpu0", have 0-byte payload, and exactly 3 vector children
     if (nodeIndex >= nodes.size() || nodes[nodeIndex].type != "cmpu0" || nodes[nodeIndex].payloadSize != 0 || nodes[nodeIndex].children.size() != 3)
     {
         return juce::Result::fail("Feature normalization requires an empty cmpu0 node with three vector children.");
@@ -18,18 +19,24 @@ juce::Result FeatureNormalizer::load(const DnniReader& reader, std::size_t nodeI
     FeatureNormalizer candidate;
     std::vector<float> range;
     const auto& children = nodes[nodeIndex].children;
+
+    // Child 0: lower bound vector
     if (const auto result = reader.readFloatVector(children[0], candidate.lower); result.failed())
     {
         return result;
     }
+    // Child 1: upper bound vector
     if (const auto result = reader.readFloatVector(children[1], candidate.upper); result.failed())
     {
         return result;
     }
+    // Child 2: target range vector (2 floats: [targetLower, targetUpper])
     if (const auto result = reader.readFloatVector(children[2], range); result.failed())
     {
         return result;
     }
+
+    // Validate dimensions and ranges
     if (candidate.lower.empty() || candidate.lower.size() != candidate.upper.size() || range.size() != 2 || !(range[0] < range[1]) || !std::isfinite(range[1] - range[0]))
     {
         return juce::Result::fail("Invalid cmpu0 channel count or target range.");
@@ -41,6 +48,7 @@ juce::Result FeatureNormalizer::load(const DnniReader& reader, std::size_t nodeI
             return juce::Result::fail("Invalid cmpu0 source range at channel " + juce::String(static_cast<juce::int64>(channel)) + ".");
         }
     }
+
     candidate.targetLower = range[0];
     candidate.targetUpper = range[1];
     *this = std::move(candidate);
@@ -76,6 +84,7 @@ juce::Result FeatureNormalizer::transform(const DnniTensor& input, DnniTensor& o
     DnniTensor result{input.frames, input.channels, {}};
     result.values.resize(input.values.size());
     const float targetRange = targetUpper - targetLower;
+
     for (std::size_t index = 0; index < input.values.size(); ++index)
     {
         const float value = input.values[index];
@@ -86,26 +95,32 @@ juce::Result FeatureNormalizer::transform(const DnniTensor& input, DnniTensor& o
         const std::size_t channel = index % input.channels;
         const float sourceRange = upper[channel] - lower[channel];
         float transformed = 0.0f;
+
+        // Inverse transform (normalized -> raw physical scale)
         if (inverse)
         {
             transformed = lower[channel] + sourceRange * (value - targetLower) / targetRange;
         }
+        // Forward transform (raw physical scale -> normalized)
         else
         {
-            // cmpu0 uses this floor only in the forward denominator, including constant channels.
+            // Floor of 1e-5 in denominator prevents division by zero for constant features
             transformed = targetLower + targetRange * (value - lower[channel]) / std::max(sourceRange, 1.0e-5f);
             if (clamp)
             {
                 transformed = std::clamp(transformed, targetLower, targetUpper);
             }
         }
+
         if (!std::isfinite(transformed))
         {
             return juce::Result::fail("Feature normalization produced a non-finite value.");
         }
         result.values[index] = transformed;
     }
+
     output = std::move(result);
     return juce::Result::ok();
 }
+
 } // namespace sv::synthesis

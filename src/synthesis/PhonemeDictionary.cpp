@@ -11,6 +11,10 @@ namespace sv::synthesis
 {
 namespace
 {
+/**
+ * @brief Decodes a UTF-8 string view into a juce::String, checking for invalid sequences,
+ * embedded NULs, and non-printable control characters.
+ */
 juce::Result decodeUtf8(std::string_view bytes, juce::String& text)
 {
     if (bytes.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
@@ -42,6 +46,9 @@ juce::Result decodeUtf8(std::string_view bytes, juce::String& text)
     return juce::Result::ok();
 }
 
+/**
+ * @brief Reads a text file, stripping optional UTF-8 Byte Order Mark (BOM).
+ */
 juce::Result readText(const juce::File& file, juce::String& text)
 {
     if (file.getSize() > std::numeric_limits<int>::max())
@@ -58,6 +65,7 @@ juce::Result readText(const juce::File& file, juce::String& text)
         return juce::Result::fail("Dictionary file is empty: " + file.getFullPathName());
     }
     std::string_view bytes(static_cast<const char*>(contents.getData()), contents.getSize());
+    // Strip UTF-8 BOM if present (\xEF\xBB\xBF)
     if (bytes.starts_with("\xef\xbb\xbf"))
     {
         bytes.remove_prefix(3);
@@ -70,6 +78,9 @@ juce::Result readText(const juce::File& file, juce::String& text)
     return juce::Result::ok();
 }
 
+/**
+ * @brief Splits a whitespace-separated line into tokens.
+ */
 juce::StringArray splitFields(const juce::String& line)
 {
     auto fields = juce::StringArray::fromTokens(line, " \t", "");
@@ -77,10 +88,14 @@ juce::StringArray splitFields(const juce::String& line)
     return fields;
 }
 
+/**
+ * @brief Normalizes English dictionary keys (lowercasing, and stripping CMU variant suffixes like "word(2)").
+ */
 std::string normalizeEnglishKey(std::string key)
 {
     std::transform(key.begin(), key.end(), key.begin(), [](unsigned char character)
                    { return static_cast<char>(std::tolower(character)); });
+    // Remove CMUDict pronunciation variation markers like "(1)", "(2)"
     if (const auto variant = key.rfind('('); variant != std::string::npos && key.back() == ')'
         && variant + 2 < key.size()
         && std::all_of(key.begin() + static_cast<std::ptrdiff_t>(variant + 1), key.end() - 1, [](unsigned char character)
@@ -91,8 +106,14 @@ std::string normalizeEnglishKey(std::string key)
     return key;
 }
 
+/**
+ * @brief Normalizes CMU ARPABET phoneme symbols:
+ * 1. Strips lexical stress digit suffixes (0 = unstressed, 1 = primary, 2 = secondary).
+ * 2. Maps historical or dialectal CMU phone variants to standard SV ARPABET symbols.
+ */
 void normalizeEnglishPhone(std::string& symbol)
 {
+    // Strip stress numbers: AA0/AA1/AA2 -> AA
     if (!symbol.empty() && symbol.back() >= '0' && symbol.back() <= '2')
     {
         symbol.pop_back();
@@ -111,6 +132,12 @@ juce::Result lineError(const juce::File& file, int line, const juce::String& mes
     return juce::Result::fail(file.getFullPathName() + ":" + juce::String(line) + ": " + message);
 }
 
+/**
+ * @brief Normalizes Mandarin Pinyin:
+ * - Lowercases.
+ * - Replaces 'u:' and 'ü' with 'v'.
+ * - Strips optional trailing tone numbers (1 to 5).
+ */
 juce::String normalizePinyin(const juce::String& text)
 {
     auto normalized = text.toLowerCase().replace("u:", "v").replace(juce::String::charToString(0x00fc), "v");
@@ -128,6 +155,10 @@ juce::String normalizePinyin(const juce::String& text)
     return normalized;
 }
 
+/**
+ * @brief Parses a line from CC-CEDICT Chinese-English dictionary:
+ * Format: Traditional Simplified [pin1 yin1] /definition 1/definition 2/
+ */
 juce::Result parseCedictEntry(const juce::String& line, juce::StringArray& headwords, juce::StringArray& reading)
 {
     const auto openingBracket = line.indexOfChar('[');
@@ -177,6 +208,8 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
     PhonemeDictionary loaded;
     loaded.isEnglishArpabet = phonesFile.getFileName() == "english-arpabet-phones.txt";
     const bool isCmuDictionary = loaded.isEnglishArpabet && dictionaryFile.getFileName() == "cmudict-07b.txt";
+
+    // 1. Parse phoneme list (phoneme, category)
     const auto phoneLines = juce::StringArray::fromLines(phonesText);
     for (int line = 0; line < phoneLines.size(); ++line)
     {
@@ -201,9 +234,11 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
         return juce::Result::fail("Phoneme inventory contains no definitions: " + phonesFile.getFullPathName());
     }
 
+    // 2. Parse dictionary (key, phoneme1, phoneme2, ...)
     const auto dictionaryLines = juce::StringArray::fromLines(dictionaryText);
     for (int line = 0; line < dictionaryLines.size(); ++line)
     {
+        // Skip CMU comments (lines starting with ';;;')
         if (isCmuDictionary && dictionaryLines[line].trimStart().startsWith(";;;"))
         {
             continue;
@@ -221,6 +256,7 @@ juce::Result PhonemeDictionary::load(const juce::File& phonesFile, const juce::F
         const auto key = loaded.isEnglishArpabet ? normalizeEnglishKey(sourceKey) : sourceKey;
         if (loaded.entries.contains(key))
         {
+            // For CMU dict, retain first pronunciation variant
             if (isCmuDictionary || sourceKey != key)
             {
                 continue;
@@ -299,6 +335,8 @@ juce::Result PhonemeDictionary::loadJapanese(const juce::File& phonesFile, const
         }
         return juce::Result::ok();
     };
+
+    // Load standard Hiragana and Katakana tables
     for (const auto& mappingFile : {hiraganaFile, katakanaFile})
     {
         if (const auto result = loadKanaMappings(mappingFile, loaded.kanaToRomaji); result.failed())
@@ -306,6 +344,7 @@ juce::Result PhonemeDictionary::loadJapanese(const juce::File& phonesFile, const
             return result;
         }
     }
+    // Load small kana tables (ゃ, ゅ, ょ, etc.)
     if (const auto result = loadKanaMappings(smallKanaFile, loaded.smallKanaToRomaji); result.failed())
     {
         return result;
@@ -327,6 +366,7 @@ juce::Result PhonemeDictionary::loadMandarin(const juce::File& phonesFile, const
         return result;
     }
 
+    // Normalize pinyin keys in dictionary (stripping tones)
     std::unordered_map<std::string, std::vector<std::string>> normalizedEntries;
     normalizedEntries.reserve(loaded.entries.size());
     for (auto& [key, pronunciation] : loaded.entries)
@@ -346,6 +386,7 @@ juce::Result PhonemeDictionary::loadMandarin(const juce::File& phonesFile, const
     }
     loaded.entries = normalizedEntries;
 
+    // Parse CC-CEDICT for Hanzi -> Pinyin mappings
     juce::String cedictText;
     if (const auto result = readText(cedictFile, cedictText); result.failed())
     {
@@ -366,6 +407,7 @@ juce::Result PhonemeDictionary::loadMandarin(const juce::File& phonesFile, const
         {
             return lineError(cedictFile, line + 1, result.getErrorMessage());
         }
+        // Only accept single-syllable Chinese character mappings
         if (reading.size() != 1)
         {
             continue;
@@ -380,7 +422,7 @@ juce::Result PhonemeDictionary::loadMandarin(const juce::File& phonesFile, const
         {
             continue;
         }
-        // Insertion order chooses the first supported pronunciation, without guessing context.
+        // Map both Traditional and Simplified characters to this pronunciation
         for (const auto& headword : headwords)
         {
             loaded.entries.try_emplace(headword.toStdString(), found->second);
@@ -415,6 +457,8 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
     {
         return juce::Result::fail("Dictionary lookup requires exactly one key without surrounding whitespace.");
     }
+
+    // Special case: Single English capital letter spelled out (A -> "EY", B -> "B IY", etc.)
     static constexpr std::array<std::string_view, 26> englishLetterNames{
         "ey", "b iy", "s iy", "d iy", "iy", "eh f", "jh iy", "ey ch", "ay", "jh ey", "k ey", "eh l", "eh m",
         "eh n", "ow", "p iy", "k y uw", "aa r", "eh s", "t iy", "y uw", "v iy", "d ah b ah l y uw", "eh k s", "w ay", "z iy"};
@@ -436,7 +480,10 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
         output = std::move(pronunciation);
         return juce::Result::ok();
     }
+
     std::string key(lyrics);
+
+    // Japanese Kana to Romaji conversion (with small kana contraction)
     if (isJapanese)
     {
         std::string romanized;
@@ -456,6 +503,8 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
                 allKana = false;
                 break;
             }
+            // Small kana digraph contraction:
+            // e.g. "ki" + "ya" -> "kya"; "shi" + "ya" -> "sha"; "chi" + "ya" -> "cha"
             const auto& smallRomaji = foundSmallKana->second;
             if (smallRomaji.size() == 2 && smallRomaji.front() == 'y' && !romanized.empty() && romanized.back() == 'i')
             {
@@ -477,11 +526,15 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
             key = std::move(romanized);
         }
     }
+
+    // Mandarin Pinyin tone normalization
     const auto normalized = isMandarin ? normalizePinyin(text) : juce::String{};
     if (!normalized.isEmpty())
     {
         key = normalized.toStdString();
     }
+
+    // Direct match in dictionary table
     const auto found = entries.find(key);
     if (found != entries.end())
     {
@@ -493,6 +546,7 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
         return juce::Result::fail("No Mandarin pronunciation for '" + text + "'. Use one dictionary-listed syllable per note: a Chinese character or pinyin (optional tone 1-5). Split multi-character lyrics across notes, or enter phonemes explicitly.");
     }
 
+    // Case-insensitive lookup
     std::string candidate = key;
     std::transform(candidate.begin(), candidate.end(), candidate.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (const auto caseInsensitive = entries.find(candidate); caseInsensitive != entries.end())
@@ -500,12 +554,15 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
         output = caseInsensitive->second;
         return juce::Result::ok();
     }
+
+    // Strip punctuation
     candidate.erase(std::remove_if(candidate.begin(), candidate.end(), [](unsigned char c) { return !std::isalnum(c); }), candidate.end());
     if (candidate.empty())
     {
         return juce::Result::fail("No pronunciation for dictionary key '" + text + "'.");
     }
 
+    // English hardcoded common word fallbacks
     static const std::unordered_map<std::string, std::vector<std::string>> englishFallbacks{
         {"a", {"ae"}},
         {"i", {"ay"}},
@@ -529,6 +586,7 @@ juce::Result PhonemeDictionary::lookup(std::string_view lyrics, std::vector<std:
         return juce::Result::ok();
     }
 
+    // Rule-based heuristic G2P grapheme-to-phoneme synthesizer for unknown English words
     std::vector<std::string> guessed;
     for (std::size_t index = 0; index < candidate.size();)
     {
@@ -684,4 +742,5 @@ std::size_t PhonemeDictionary::getEntryCount() const
 {
     return entries.size();
 }
+
 } // namespace sv::synthesis

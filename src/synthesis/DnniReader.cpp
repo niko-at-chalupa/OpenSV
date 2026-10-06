@@ -10,15 +10,33 @@ namespace sv::synthesis
 {
 namespace
 {
-constexpr std::size_t maximumModelBytes = 512 * 1024 * 1024;
+constexpr std::size_t maximumModelBytes = 512 * 1024 * 1024; // 512 MiB limit for neural net models
 constexpr std::size_t maximumNodes = 1000000;
 constexpr unsigned maximumDepth = 256;
 constexpr std::size_t nodeHeaderBytes = 20;
 
+/**
+ * @brief Resolves an obfuscated 64-bit DNNI version 2 typeId to its ASCII type name.
+ *
+ * In DNNI format version 2, layer type names (e.g. "prim0", "modm0", "_psv2") are hashed
+ * with a 64-bit FNV-1a hash using one of 12 known initial seed values.
+ * This table checks candidate known node names against those seeds.
+ */
 std::string resolveType(std::uint64_t typeId)
 {
-    constexpr std::array<std::uint64_t, 12> seeds{0x0dcd59189d5a0f24, 0x59346d79970ca21e, 0xcf3519b773b767bf, 0x562c8e41fb7fbee2, 0xbd6d25457e1ed24e, 0x0123456789abcdef, 0x76543210fedcba98, 0x02468aceeca86420, 0xeca864202468acee, 0x70556f5965766947, 0x5a4d5a4d5a4d5a4d, 0x000000626d6f6379};
-    for (const auto* name : {"prim0", "prim1", "prim2", "prim3", "prim4", "prim5", "modm0", "modl0", "modl1", "modl3", "modl4", "modl6", "moda0", "moda1", "moda2", "moda3", "moda4", "moda5", "moda7", "_gnc1v0", "_ncwnv0", "cmpg1", "cmpu0", "cmpu1", "_vocfv1", "_vocfv2", "_ppusv0", "_ppdsv0", "_psv2", "_rldtg0", "_rldms0", "_stbkv1", "_vqctx1", "_didsv0", "_ftmfv2", "_ftmfv3", "_dctov0"})
+    constexpr std::array<std::uint64_t, 12> seeds{
+        0x0dcd59189d5a0f24, 0x59346d79970ca21e, 0xcf3519b773b767bf, 0x562c8e41fb7fbee2,
+        0xbd6d25457e1ed24e, 0x0123456789abcdef, 0x76543210fedcba98, 0x02468aceeca86420,
+        0xeca864202468acee, 0x70556f5965766947, 0x5a4d5a4d5a4d5a4d, 0x000000626d6f6379};
+
+    for (const auto* name : {
+        "prim0", "prim1", "prim2", "prim3", "prim4", "prim5",
+        "modm0", "modl0", "modl1", "modl3", "modl4", "modl6",
+        "moda0", "moda1", "moda2", "moda3", "moda4", "moda5", "moda7",
+        "_gnc1v0", "_ncwnv0", "cmpg1", "cmpu0", "cmpu1",
+        "_vocfv1", "_vocfv2", "_ppusv0", "_ppdsv0", "_psv2",
+        "_rldtg0", "_rldms0", "_stbkv1", "_vqctx1", "_didsv0",
+        "_ftmfv2", "_ftmfv3", "_dctov0"})
     {
         for (auto hash : seeds)
         {
@@ -35,9 +53,15 @@ std::string resolveType(std::uint64_t typeId)
     return {};
 }
 
+/**
+ * @brief Reads a 32-bit unsigned little-endian integer.
+ */
 std::uint32_t readUint32(const std::uint8_t* bytes)
 {
-    return static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8) | (static_cast<std::uint32_t>(bytes[2]) << 16) | (static_cast<std::uint32_t>(bytes[3]) << 24);
+    return static_cast<std::uint32_t>(bytes[0])
+         | (static_cast<std::uint32_t>(bytes[1]) << 8)
+         | (static_cast<std::uint32_t>(bytes[2]) << 16)
+         | (static_cast<std::uint32_t>(bytes[3]) << 24);
 }
 
 juce::Result malformed(std::size_t offset, const juce::String& reason)
@@ -45,6 +69,9 @@ juce::Result malformed(std::size_t offset, const juce::String& reason)
     return juce::Result::fail("DNNI offset 0x" + juce::String::toHexString(static_cast<juce::int64>(offset)) + ": " + reason);
 }
 
+/**
+ * @brief Decodes an array of 32-bit IEEE-754 floating-point numbers from binary bytes.
+ */
 juce::Result decodeFloats(std::span<const std::uint8_t> bytes, std::size_t count, std::vector<float>& output)
 {
     if (count > bytes.size() / sizeof(float) || count * sizeof(float) != bytes.size())
@@ -65,6 +92,9 @@ juce::Result decodeFloats(std::span<const std::uint8_t> bytes, std::size_t count
     return juce::Result::ok();
 }
 
+/**
+ * @brief Reads a signed quantized integer (8-bit or 16-bit) from byte memory.
+ */
 std::int32_t readQuantized(const std::uint8_t* bytes, unsigned bits)
 {
     if (bits == 8)
@@ -75,12 +105,23 @@ std::int32_t readQuantized(const std::uint8_t* bytes, unsigned bits)
     return std::bit_cast<std::int16_t>(value);
 }
 
+/**
+ * @brief Decompresses and dequantizes weight matrices from DNNI payloads.
+ *
+ * Supported matrix representations:
+ * - Unquantized dense (`prim0`): 32-bit float array.
+ * - Quantized dense (`prim4`): 8-bit or 16-bit signed ints, with per-row floating-point scaling.
+ * - Unquantized sparse (`prim3`): Block Compressed Sparse Row (BCSR) format.
+ * - Quantized sparse (`prim5`): BCSR blocks with 8/16-bit quantized weights and row scales.
+ */
 juce::Result decodeMatrix(std::span<const std::uint8_t> payload, const std::string& type, DnniMatrix& output)
 {
     const bool quantized = type == "prim4" || type == "prim5";
     const bool sparse = type == "prim3" || type == "prim5";
     unsigned bits = 32;
     std::vector<float> scales;
+
+    // 1. Read quantization header if matrix is quantized
     if (quantized)
     {
         if (payload.size() < 16)
@@ -108,6 +149,8 @@ juce::Result decodeMatrix(std::span<const std::uint8_t> payload, const std::stri
         }
         payload = payload.subspan(16 + scaleCount * 4);
     }
+
+    // 2. Read dimensions (rows, columns)
     const std::size_t headerSize = sparse ? 20 : 8;
     if (payload.size() < headerSize)
     {
@@ -125,6 +168,8 @@ juce::Result decodeMatrix(std::span<const std::uint8_t> payload, const std::stri
     {
         return juce::Result::fail("DNNI quantized matrix must have one scale per output row.");
     }
+
+    // 3. Dense unquantized float matrix
     if (!sparse && !quantized)
     {
         if (auto result = decodeFloats(payload.subspan(8), static_cast<std::size_t>(elementCount), matrix.values); result.failed())
@@ -134,8 +179,11 @@ juce::Result decodeMatrix(std::span<const std::uint8_t> payload, const std::stri
         output = std::move(matrix);
         return juce::Result::ok();
     }
+
     const auto bytesPerElement = static_cast<std::size_t>(bits / 8);
-    const float divisor = std::ldexp(1.0f, static_cast<int>(bits) - 1);
+    const float divisor = std::ldexp(1.0f, static_cast<int>(bits) - 1); // 128.0 for 8-bit, 32768.0 for 16-bit
+
+    // 4. Dense quantized matrix (row-scaled)
     if (!sparse)
     {
         payload = payload.subspan(8);
@@ -148,17 +196,20 @@ juce::Result decodeMatrix(std::span<const std::uint8_t> payload, const std::stri
         {
             for (std::size_t column = 0; column < matrix.columns; ++column)
             {
+                // In DNNI, column-major integer storage is mapped to row-major float storage
                 const auto integer = readQuantized(payload.data() + (column * matrix.rows + row) * bytesPerElement, bits);
                 matrix.values[row * matrix.columns + column] = (static_cast<float>(integer) / divisor) * scales[row];
             }
         }
     }
+    // 5. Block Compressed Sparse Row (BCSR) sparse matrix
     else
     {
         const auto blockRows = static_cast<std::size_t>(readUint32(payload.data() + 8));
         const auto blockColumns = static_cast<std::size_t>(readUint32(payload.data() + 12));
         const auto blockCount = static_cast<std::size_t>(readUint32(payload.data() + 16));
-        if (blockRows == 0 || blockColumns == 0 || blockRows > matrix.rows || blockColumns > matrix.columns || matrix.rows % blockRows != 0 || matrix.columns % blockColumns != 0)
+        if (blockRows == 0 || blockColumns == 0 || blockRows > matrix.rows || blockColumns > matrix.columns ||
+            matrix.rows % blockRows != 0 || matrix.columns % blockColumns != 0)
         {
             return juce::Result::fail("DNNI sparse matrix has unsupported partial or empty block dimensions.");
         }
@@ -205,7 +256,8 @@ juce::Result decodeMatrix(std::span<const std::uint8_t> payload, const std::stri
                         const auto* coefficient = coefficients + (block * blockRows * blockColumns + column * blockRows + row) * bytesPerElement;
                         const auto outputRow = blockRow * blockRows + row;
                         const auto outputColumn = columnBlock * blockColumns + column;
-                        const float value = quantized ? (static_cast<float>(readQuantized(coefficient, bits)) / divisor) * scales[outputRow] : std::bit_cast<float>(readUint32(coefficient));
+                        const float value = quantized ? (static_cast<float>(readQuantized(coefficient, bits)) / divisor) * scales[outputRow]
+                                                      : std::bit_cast<float>(readUint32(coefficient));
                         auto& destination = matrix.values[outputRow * matrix.columns + outputColumn];
                         destination += value;
                         if (!std::isfinite(destination))
@@ -275,6 +327,7 @@ juce::Result DnniReader::parse()
         return malformed(0, "model must contain a header and fit within 512 MiB.");
     }
     const auto* bytes = static_cast<const std::uint8_t*>(data.getData());
+    // Magic check: 0x7fca00ff
     if (readUint32(bytes) != 0x7fca00ff)
     {
         return malformed(0, "unrecognised file signature.");
@@ -284,6 +337,7 @@ juce::Result DnniReader::parse()
     {
         return malformed(4, "unsupported format version " + juce::String(version) + ".");
     }
+
     std::size_t position = 8;
     std::size_t root = 0;
     const auto result = parseNode(position, 0, root);
@@ -319,6 +373,8 @@ juce::Result DnniReader::parseNode(std::size_t& position, unsigned depth, std::s
     const auto typeId = static_cast<std::uint64_t>(typeLow) | (static_cast<std::uint64_t>(typeHigh) << 32);
     std::string type;
     bool terminated = false;
+
+    // In format v1, node type is an 8-byte ASCII string
     for (std::size_t index = 4; version == 1 && index < 12; ++index)
     {
         const auto character = bytes[index];
@@ -335,6 +391,8 @@ juce::Result DnniReader::parseNode(std::size_t& position, unsigned depth, std::s
             type.push_back(static_cast<char>(character));
         }
     }
+
+    // In format v2, node type is resolved by matching the 64-bit FNV-1a hash
     if (version == 2)
     {
         type = resolveType(typeId);
@@ -347,6 +405,8 @@ juce::Result DnniReader::parseNode(std::size_t& position, unsigned depth, std::s
     {
         return malformed(position + 4, "empty node type tag.");
     }
+
+    // In format v2, child count is obfuscated
     auto childCount = readUint32(bytes + 12);
     if (version == 2)
     {
@@ -357,6 +417,7 @@ juce::Result DnniReader::parseNode(std::size_t& position, unsigned depth, std::s
         }
         childCount /= 3;
     }
+
     const auto payloadSize = static_cast<std::size_t>(readUint32(bytes + 16));
     if (payloadSize > data.getSize() - position - nodeHeaderBytes)
     {
@@ -368,9 +429,12 @@ juce::Result DnniReader::parseNode(std::size_t& position, unsigned depth, std::s
     {
         return malformed(payloadOffset - 8, "child count exceeds the remaining file.");
     }
+
     nodeIndex = nodes.size();
     nodes.push_back({marker, typeId, std::move(type), payloadOffset - nodeHeaderBytes, payloadOffset, payloadSize, {}});
     nodes[nodeIndex].children.reserve(childCount);
+
+    // Recursively parse children
     for (std::uint32_t child = 0; child < childCount; ++child)
     {
         std::size_t childIndex = 0;
@@ -400,11 +464,14 @@ juce::Result DnniReader::readFloatVector(std::size_t nodeIndex, std::vector<floa
 
 juce::Result DnniReader::readFloatMatrix(std::size_t nodeIndex, DnniMatrix& matrix) const
 {
-    if (nodeIndex >= nodes.size() || (nodes[nodeIndex].type != "prim0" && nodes[nodeIndex].type != "prim2" && nodes[nodeIndex].type != "prim3" && nodes[nodeIndex].type != "prim4" && nodes[nodeIndex].type != "prim5"))
+    if (nodeIndex >= nodes.size() ||
+        (nodes[nodeIndex].type != "prim0" && nodes[nodeIndex].type != "prim2" &&
+         nodes[nodeIndex].type != "prim3" && nodes[nodeIndex].type != "prim4" && nodes[nodeIndex].type != "prim5"))
     {
         return juce::Result::fail("The requested DNNI node is not a supported float matrix.");
     }
     const auto payload = getPayload(nodeIndex);
     return decodeMatrix(payload, nodes[nodeIndex].type, matrix);
 }
+
 } // namespace sv::synthesis

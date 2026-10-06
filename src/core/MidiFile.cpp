@@ -15,9 +15,19 @@ namespace sv
 {
 namespace
 {
+// High-resolution PPQ (Pulses Per Quarter note) used for MIDI export.
+// 9600 ticks/quarter note gives high timing precision while remaining standard.
 constexpr int exportTicksPerQuarter = 9600;
+
+// Maximum valid MIDI tick timestamp (28-bit unsigned integer in standard MIDI specs).
 constexpr int maxMidiTick = 0x0fffffff;
 
+/**
+ * @brief Converts MIDI ticks (at a specified PPQ) to OpenSV Blicks.
+ *
+ * Uses extended precision (long double) to avoid overflow before rounding.
+ * Formula: position = ticks * (blicksPerQuarter / ticksPerQuarter).
+ */
 std::optional<Blick> ticksToBlick(double ticks, int ticksPerQuarter)
 {
     const auto position = static_cast<long double>(ticks) * blicksPerQuarter / ticksPerQuarter;
@@ -29,6 +39,9 @@ std::optional<Blick> ticksToBlick(double ticks, int ticksPerQuarter)
     return static_cast<Blick>(std::round(position));
 }
 
+/**
+ * @brief Converts OpenSV Blicks to MIDI export ticks at 9600 PPQ.
+ */
 std::optional<double> blickToTicks(Blick position)
 {
     const auto ticks = std::round(static_cast<long double>(position) * exportTicksPerQuarter / blicksPerQuarter);
@@ -40,27 +53,45 @@ std::optional<double> blickToTicks(Blick position)
     return static_cast<double>(ticks);
 }
 
+/**
+ * @brief Validates time signature numerator and denominator.
+ * Denominator must be a positive power of 2 (1, 2, 4, 8, 16, 32, 64, 128).
+ */
 bool isValidTimeSignature(int numerator, int denominator)
 {
     return numerator > 0 && numerator <= 255 && denominator > 0 && denominator <= 128 && (denominator & (denominator - 1)) == 0;
 }
 
+/**
+ * @brief Computes length of one musical measure/bar in Blicks for a given time signature.
+ *
+ * Example: 4/4 meter -> 705600000 * 4 * 4 / 4 = 4 * 705600000 blicks.
+ * Example: 3/4 meter -> 705600000 * 4 * 3 / 4 = 3 * 705600000 blicks.
+ * Example: 6/8 meter -> 705600000 * 4 * 6 / 8 = 3 * 705600000 blicks.
+ */
 Blick barLength(const TimeSignature& signature)
 {
     return blicksPerQuarter * 4 * signature.numerator / signature.denominator;
 }
 
+/**
+ * @brief Adds a MIDI message to a sequence at the specified tick timestamp.
+ */
 void addEvent(juce::MidiMessageSequence& sequence, juce::MidiMessage message, double ticks)
 {
     message.setTimeStamp(ticks);
     sequence.addEvent(message);
 }
 
+/**
+ * @brief Extracts tempo and time signature events from a loaded MIDI file into a TempoMap.
+ */
 juce::Result importTempoMap(const juce::MidiFile& midi, TempoMap& tempoMap)
 {
+    // Step 1: Extract all tempo events
     juce::MidiMessageSequence tempoEvents;
     midi.findAllTempoEvents(tempoEvents);
-    std::map<Blick, double> tempos{{0, 120.0}};
+    std::map<Blick, double> tempos{{0, 120.0}}; // Default fallback at position 0
     for (const auto* event : tempoEvents)
     {
         const auto& message = event->message;
@@ -79,9 +110,10 @@ juce::Result importTempoMap(const juce::MidiFile& midi, TempoMap& tempoMap)
         tempoMap.tempos.push_back({position, bpm, {}});
     }
 
+    // Step 2: Extract all time signature events
     juce::MidiMessageSequence signatureEvents;
     midi.findAllTimeSigEvents(signatureEvents);
-    std::map<Blick, TimeSignature> signatures{{0, {0, 4, 4, {}}}};
+    std::map<Blick, TimeSignature> signatures{{0, {0, 4, 4, {}}}}; // Default 4/4 meter
     for (const auto* event : signatureEvents)
     {
         const auto& message = event->message;
@@ -101,6 +133,7 @@ juce::Result importTempoMap(const juce::MidiFile& midi, TempoMap& tempoMap)
         signatures[*position] = signature;
     }
 
+    // Step 3: Align time signature changes to musical bars
     tempoMap.timeSignatures.clear();
     Blick previousPosition = 0;
     TimeSignature previousSignature;
@@ -109,6 +142,7 @@ juce::Result importTempoMap(const juce::MidiFile& midi, TempoMap& tempoMap)
         const auto length = barLength(previousSignature);
         const auto distance = position - previousPosition;
         const auto bars = distance / length;
+        // In OpenSV / SV, meter changes must happen on bar boundaries
         if (distance % length != 0)
         {
             return juce::Result::fail("MIDI import: time signature changes inside a bar are not supported.");
@@ -127,10 +161,18 @@ juce::Result importTempoMap(const juce::MidiFile& midi, TempoMap& tempoMap)
     return juce::Result::ok();
 }
 
+/**
+ * @brief Imports notes and lyrics from a single MIDI sequence into Track objects.
+ *
+ * Handles MIDI channels: notes on different channels within the same MIDI track
+ * are split into distinct tracks.
+ */
 juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIndex, int ticksPerQuarter, std::vector<Track>& tracks)
 {
     std::string name = "Track " + std::to_string(sourceIndex + 1);
     std::map<Blick, std::string> lyrics;
+
+    // Scan for track name meta-events and lyric meta-events (meta-type 5)
     for (const auto* event : sequence)
     {
         const auto& message = event->message;
@@ -149,8 +191,10 @@ juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIn
         }
     }
 
+    // Pair Note-On with Note-Off events per (channel, pitch) key
     std::array<std::optional<Track>, 16> channelTracks;
     std::map<int, std::deque<std::size_t>> activeNotes;
+
     for (const auto* event : sequence)
     {
         const auto& message = event->message;
@@ -164,6 +208,7 @@ juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIn
         const auto position = *ticksToBlick(message.getTimeStamp(), ticksPerQuarter);
         auto& active = activeNotes[channel * 128 + pitch];
         auto& track = channelTracks[static_cast<std::size_t>(channel)];
+
         if (message.isNoteOn())
         {
             if (!track)
@@ -176,7 +221,7 @@ juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIn
             Note note;
             note.id = createNoteId();
             note.onset = position;
-            note.duration = 0;
+            note.duration = 0; // Completed when matching note-off is encountered
             note.pitch = pitch;
             if (const auto lyric = lyrics.find(position); lyric != lyrics.end())
             {
@@ -187,6 +232,7 @@ juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIn
         }
         else if (!active.empty())
         {
+            // Note-Off matches the earliest pending Note-On of the same pitch
             auto& note = track->mainGroup.notes[active.front()];
             active.pop_front();
             if (position <= note.onset)
@@ -198,6 +244,7 @@ juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIn
         }
     }
 
+    // Verify all notes were properly closed
     for (const auto& entry : activeNotes)
     {
         if (!entry.second.empty())
@@ -206,6 +253,7 @@ juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIn
         }
     }
 
+    // Append populated tracks to output vector
     const auto channelCount = std::count_if(channelTracks.begin(), channelTracks.end(), [](const auto& track)
                                             { return track.has_value(); });
     for (std::size_t channel = 0; channel < channelTracks.size(); ++channel)
@@ -224,6 +272,9 @@ juce::Result importTrack(const juce::MidiMessageSequence& sequence, int sourceIn
     return juce::Result::ok();
 }
 
+/**
+ * @brief Exports tempo and meter timelines to MIDI Track 0 (conductor track).
+ */
 juce::Result exportTempoMap(const TempoMap& tempoMap, juce::MidiMessageSequence& sequence)
 {
     if (tempoMap.tempos.empty() || tempoMap.tempos.front().position != 0 || tempoMap.timeSignatures.empty() || tempoMap.timeSignatures.front().bar != 0)
@@ -231,6 +282,7 @@ juce::Result exportTempoMap(const TempoMap& tempoMap, juce::MidiMessageSequence&
         return juce::Result::fail("MIDI export: tempo and time signature maps must begin at the project start.");
     }
 
+    // Export tempo changes (microseconds per quarter note)
     Blick previousTempoPosition = -1;
     for (const auto& tempo : tempoMap.tempos)
     {
@@ -245,6 +297,7 @@ juce::Result exportTempoMap(const TempoMap& tempoMap, juce::MidiMessageSequence&
         previousTempoPosition = tempo.position;
     }
 
+    // Export time signatures
     Blick position = 0;
     TimeSignature previousSignature;
     for (std::size_t index = 0; index < tempoMap.timeSignatures.size(); ++index)
@@ -275,6 +328,9 @@ juce::Result exportTempoMap(const TempoMap& tempoMap, juce::MidiMessageSequence&
     return juce::Result::ok();
 }
 
+/**
+ * @brief Exports notes from a NoteGroup referenced on a track to MIDI events.
+ */
 juce::Result exportGroup(const NoteGroup& group, const GroupReference& reference, int channel, juce::MidiMessageSequence& sequence)
 {
     if (reference.isInstrumental)
@@ -301,6 +357,7 @@ juce::Result exportGroup(const NoteGroup& group, const GroupReference& reference
             return juce::Result::fail("MIDI export: note position exceeds the supported range.");
         }
 
+        // Apply crop boundaries (clipping window)
         const auto clippedStart = std::max(onset, reference.absoluteBegin);
         const auto clippedEnd = reference.absoluteEnd < 0 ? onset + note.duration : std::min(onset + note.duration, reference.absoluteEnd);
         if (clippedEnd <= clippedStart)
@@ -314,11 +371,14 @@ juce::Result exportGroup(const NoteGroup& group, const GroupReference& reference
         {
             return juce::Result::fail("MIDI export: note position or duration cannot be represented at 9600 ticks per quarter note.");
         }
+
+        // Export lyrics as MIDI meta-event type 5 on note onset
         if (!note.lyrics.empty())
         {
             addEvent(sequence, juce::MidiMessage::textMetaEvent(5, juce::String::fromUTF8(note.lyrics.c_str())), *startTicks);
         }
 
+        // Standard Note-On with default velocity 100, and Note-Off
         addEvent(sequence, juce::MidiMessage::noteOn(channel, static_cast<int>(pitch), static_cast<juce::uint8>(100)), *startTicks);
         addEvent(sequence, juce::MidiMessage::noteOff(channel, static_cast<int>(pitch)), *endTicks);
     }
@@ -382,6 +442,8 @@ juce::Result exportMidiFile(const juce::File& file, const Project& project)
 
     juce::MidiFile midi;
     midi.setTicksPerQuarterNote(exportTicksPerQuarter);
+
+    // Track 0: Conductor track with song title, tempo, and time signatures
     juce::MidiMessageSequence conductor;
     addEvent(conductor, juce::MidiMessage::textMetaEvent(3, juce::String::fromUTF8(project.name.c_str())), 0.0);
     if (const auto result = exportTempoMap(project.tempoMap, conductor); result.failed())
@@ -390,14 +452,17 @@ juce::Result exportMidiFile(const juce::File& file, const Project& project)
     }
     midi.addTrack(conductor);
 
+    // Track 1..N: Musical vocal tracks
     for (std::size_t index = 0; index < project.tracks.size(); ++index)
     {
         const auto& track = project.tracks[index];
-        // Channel 10 is reserved for percussion in General MIDI.
+        // Channel assignment: modulo 15, skipping GM Channel 10 (reserved for drums/percussion)
         const auto channelIndex = static_cast<int>(index % 15);
         const int channel = channelIndex < 9 ? channelIndex + 1 : channelIndex + 2;
+
         juce::MidiMessageSequence sequence;
         addEvent(sequence, juce::MidiMessage::textMetaEvent(3, juce::String::fromUTF8(track.name.c_str())), 0.0);
+
         if (const auto result = exportGroup(track.mainGroup, track.mainRef, channel, sequence); result.failed())
         {
             return result;
@@ -421,13 +486,14 @@ juce::Result exportMidiFile(const juce::File& file, const Project& project)
         midi.addTrack(sequence);
     }
 
+    // Atomic write to avoid partial/corrupt files on interruption
     juce::TemporaryFile temporary(file);
     auto stream = temporary.getFile().createOutputStream();
     if (!stream || stream->getStatus().failed())
     {
         return juce::Result::fail("MIDI export: could not create " + file.getFullPathName());
     }
-    const bool written = midi.writeTo(*stream, 1);
+    const bool written = midi.writeTo(*stream, 1); // Format 1 (multi-track)
     stream->flush();
     if (!written || stream->getStatus().failed())
     {
@@ -441,4 +507,5 @@ juce::Result exportMidiFile(const juce::File& file, const Project& project)
 
     return juce::Result::ok();
 }
+
 } // namespace sv

@@ -11,16 +11,17 @@ namespace sv::synthesis
 {
 namespace
 {
-constexpr std::uint32_t nofsMagic = 0xf580;
-constexpr std::uint32_t supportedVersion = 10;
-constexpr std::uint16_t indexBlockType = 0x1000;
-constexpr std::uint16_t valueBlockType = 1;
-constexpr std::uint64_t fileHeaderSize = 16;
-constexpr std::uint32_t maximumEntrySize = 512 * 1024 * 1024;
-constexpr std::uint32_t maximumMetadataSize = 1024 * 1024;
-constexpr std::uint64_t maximumTotalKeySize = 16 * 1024 * 1024;
-constexpr std::uint64_t maximumTotalMetadataSize = 16 * 1024 * 1024;
-constexpr std::size_t maximumEntryCount = 100000;
+// NOFS binary file constants
+constexpr std::uint32_t nofsMagic = 0xf580;           ///< 32-bit magic word at offset 0
+constexpr std::uint32_t supportedVersion = 10;        ///< Supported NOFS file format version
+constexpr std::uint16_t indexBlockType = 0x1000;      ///< Block type tag for the file index block
+constexpr std::uint16_t valueBlockType = 1;           ///< Block type tag for data record blocks
+constexpr std::uint64_t fileHeaderSize = 16;          ///< Primary header size in bytes
+constexpr std::uint32_t maximumEntrySize = 512 * 1024 * 1024;    ///< 512 MiB maximum single entry read limit
+constexpr std::uint32_t maximumMetadataSize = 1024 * 1024;       ///< 1 MiB maximum single metadata entry limit
+constexpr std::uint64_t maximumTotalKeySize = 16 * 1024 * 1024;  ///< 16 MiB cumulative key size limit
+constexpr std::uint64_t maximumTotalMetadataSize = 16 * 1024 * 1024; ///< 16 MiB cumulative metadata limit
+constexpr std::size_t maximumEntryCount = 100000;     ///< Sanity threshold for number of entries
 
 std::uint16_t readUint16(const void* data)
 {
@@ -37,9 +38,14 @@ std::uint64_t readUint64(const void* data)
     return juce::ByteOrder::littleEndianInt64(data);
 }
 
+/**
+ * @brief Reads a chunk of bytes from a specific file offset.
+ */
 bool readAt(juce::FileInputStream& stream, std::uint64_t offset, void* destination, int size)
 {
-    return offset <= static_cast<std::uint64_t>(std::numeric_limits<juce::int64>::max()) && stream.setPosition(static_cast<juce::int64>(offset)) && stream.read(destination, size) == size;
+    return offset <= static_cast<std::uint64_t>(std::numeric_limits<juce::int64>::max()) &&
+           stream.setPosition(static_cast<juce::int64>(offset)) &&
+           stream.read(destination, size) == size;
 }
 
 juce::Result invalid(const juce::String& detail)
@@ -47,6 +53,9 @@ juce::Result invalid(const juce::String& detail)
     return juce::Result::fail("NOFS: " + detail);
 }
 
+/**
+ * @brief Validates if raw memory block contains printable UTF-8 text.
+ */
 bool isText(const juce::MemoryBlock& block, bool allowWhitespace)
 {
     if (block.isEmpty())
@@ -54,20 +63,26 @@ bool isText(const juce::MemoryBlock& block, bool allowWhitespace)
         return true;
     }
     const auto* data = static_cast<const char*>(block.getData());
-    if (block.getSize() > static_cast<std::size_t>(std::numeric_limits<int>::max()) || !juce::CharPointer_UTF8::isValidString(data, static_cast<int>(block.getSize())))
+    if (block.getSize() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !juce::CharPointer_UTF8::isValidString(data, static_cast<int>(block.getSize())))
     {
         return false;
     }
     return std::none_of(data, data + block.getSize(), [allowWhitespace](char value)
-                        {
+    {
         const auto byte = static_cast<unsigned char>(value);
-        return byte == 0 || byte == 0x7f || (byte < 0x20 && !(allowWhitespace && (byte == '\n' || byte == '\r' || byte == '\t'))); });
+        return byte == 0 || byte == 0x7f || (byte < 0x20 && !(allowWhitespace && (byte == '\n' || byte == '\r' || byte == '\t')));
+    });
 }
 
+/**
+ * @brief Converts UTF-8 memory block to juce::String.
+ */
 juce::String textOf(const juce::MemoryBlock& block)
 {
     return block.isEmpty() ? juce::String() : juce::String::fromUTF8(static_cast<const char*>(block.getData()), static_cast<int>(block.getSize()));
 }
+
 } // namespace
 
 juce::Result VoiceDatabase::open(const juce::File& newFile)
@@ -88,6 +103,11 @@ juce::Result VoiceDatabase::open(const juce::File& newFile)
         return invalid("truncated file header");
     }
     const auto fileSize = static_cast<std::uint64_t>(signedSize);
+
+    // 1. Validate 16-byte NOFS primary header:
+    // Offset 0 (4 bytes): Magic word (0xf580)
+    // Offset 4 (4 bytes): Version (10)
+    // Offset 8 (8 bytes): Total file length matching physical file size
     std::array<std::uint8_t, 16> header{};
     if (!readAt(*candidate, 0, header.data(), static_cast<int>(header.size())))
     {
@@ -106,6 +126,10 @@ juce::Result VoiceDatabase::open(const juce::File& newFile)
         return invalid("declared file length does not match the file");
     }
 
+    // 2. Validate Index Block immediately following the file header:
+    // Offset 16:
+    // [0..3]: Index block total size (including 4-byte trailer)
+    // [4..5]: Block type (0x1000 = indexBlockType)
     std::array<std::uint8_t, 8> blockHeader{};
     if (!readAt(*candidate, fileHeaderSize, blockHeader.data(), static_cast<int>(blockHeader.size())))
     {
@@ -117,20 +141,30 @@ juce::Result VoiceDatabase::open(const juce::File& newFile)
         return invalid("invalid or unsupported index block");
     }
     std::array<std::uint8_t, 4> lengthBytes{};
-    if (!readAt(*candidate, fileHeaderSize + indexSize - 4, lengthBytes.data(), static_cast<int>(lengthBytes.size())) || readUint32(lengthBytes.data()) != indexSize)
+    if (!readAt(*candidate, fileHeaderSize + indexSize - 4, lengthBytes.data(), static_cast<int>(lengthBytes.size())) ||
+        readUint32(lengthBytes.data()) != indexSize)
     {
         return invalid("index block trailer mismatch");
     }
 
-    // The index hash algorithm is not required for a checked sequential walk.
-    // Both observed files contain contiguous value blocks through the exact EOF.
+    // 3. Sequentially parse contiguous value blocks starting right after the index block:
+    // Each value record block has:
+    // [0..3]: recordSize (total bytes of this record)
+    // [4..5]: recordType (1 = valueBlockType)
+    // [6..7]: keySize (bytes in key)
+    // [8..8+keySize-1]: raw key bytes
+    // [8+keySize..11+keySize]: valueSize (4 bytes)
+    // [12+keySize..12+keySize+valueSize-1]: value payload
+    // [recordSize-4..recordSize-1]: 4-byte trailer repeating recordSize
     std::vector<VoiceEntry> parsed;
     std::unordered_set<std::string> keys;
     std::uint64_t totalKeySize = 0;
     auto offset = fileHeaderSize + indexSize;
+
     while (offset < fileSize)
     {
-        if (parsed.size() >= maximumEntryCount || fileSize - offset < 16 || !readAt(*candidate, offset, blockHeader.data(), static_cast<int>(blockHeader.size())))
+        if (parsed.size() >= maximumEntryCount || fileSize - offset < 16 ||
+            !readAt(*candidate, offset, blockHeader.data(), static_cast<int>(blockHeader.size())))
         {
             return invalid("too many entries or truncated value block header");
         }
@@ -176,7 +210,8 @@ juce::Result VoiceDatabase::open(const juce::File& newFile)
         {
             return invalid("value length does not match its block");
         }
-        if (!readAt(*candidate, offset + recordSize - 4, lengthBytes.data(), static_cast<int>(lengthBytes.size())) || readUint32(lengthBytes.data()) != recordSize)
+        if (!readAt(*candidate, offset + recordSize - 4, lengthBytes.data(), static_cast<int>(lengthBytes.size())) ||
+            readUint32(lengthBytes.data()) != recordSize)
         {
             return invalid("value block trailer mismatch");
         }
@@ -191,6 +226,8 @@ juce::Result VoiceDatabase::open(const juce::File& newFile)
     file = newFile;
     stream = std::move(candidate);
     entries = std::move(parsed);
+
+    // 4. Extract metadata properties (entries with names starting with '.')
     auto result = readMetadata();
     if (result.failed())
     {
@@ -257,6 +294,7 @@ juce::Result VoiceDatabase::readEntry(const VoiceEntry& entry, juce::MemoryBlock
 juce::Result VoiceDatabase::readMetadata()
 {
     std::uint64_t totalMetadataSize = 0;
+    // Scan all entries whose keys are dot-prefixed ASCII strings (e.g. ".name", ".language")
     for (const auto& entry : entries)
     {
         if (!entry.name.startsWithChar('.'))
@@ -283,6 +321,8 @@ juce::Result VoiceDatabase::readMetadata()
         }
         metadata.properties.set(entry.name, textOf(value));
     }
+
+    // Populate structured fields from metadata properties
     metadata.name = metadata.properties[".name"];
     metadata.vendor = metadata.properties[".vendor"];
     metadata.language = metadata.properties[".language"];
@@ -290,6 +330,7 @@ juce::Result VoiceDatabase::readMetadata()
     metadata.type = metadata.properties[".type"];
     metadata.languages.addTokens(metadata.properties[".multi"], false);
     metadata.timbreStyles.addTokens(metadata.properties[".timbre_styles"], false);
+
     const auto version = metadata.properties[".version"];
     if (version.isNotEmpty())
     {
@@ -301,4 +342,5 @@ juce::Result VoiceDatabase::readMetadata()
     }
     return juce::Result::ok();
 }
+
 } // namespace sv::synthesis
