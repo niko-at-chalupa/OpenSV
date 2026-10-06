@@ -533,7 +533,11 @@ juce::Result buildPitch(const Project& project, std::span<const RenderNote> note
         const auto& note = notes[noteIndex];
         const auto position = localCurvePosition(project.tempoMap.secondsToBlick(seconds), note.reference->timeOffset);
         double automaticDelta = 0.0;
-        if (!residual.empty())
+        // SVP's systemPitchDelta is already the source editor's generated pitch
+        // contour. Adding a second neural prediction over it double-counts
+        // natural pitch motion and can sound unstable. Fall back to our model
+        // only where the project has no imported system contour for this group.
+        if (note.reference->systemPitchDelta.points.empty() && !residual.empty())
         {
             const double modelFrame = std::clamp((seconds - pitchStartSeconds) / static_cast<double>(pitchFrameIntervalSeconds), 0.0, static_cast<double>(residual.size() - 1));
             const auto left = static_cast<std::size_t>(modelFrame);
@@ -1418,7 +1422,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 const double pitchStartSeconds = notes.front().startSeconds - synthesis::VoiceSynthesizer::pitchContextSeconds;
                 float pitchFrameInterval = 0.0f;
                 if (std::any_of(notes.begin(), notes.end(), [](const RenderNote& note)
-                                { return note.note->instantMode; }))
+                                { return note.note->instantMode && note.reference->systemPitchDelta.points.empty(); }))
                 {
                     const auto pitchConfiguration = std::find_if(phrases.begin(), phrases.end(), [&voiceSource](const CachedPhrase& entry)
                                                                  { return entry.voiceSource == voiceSource && entry.pitchFrameIntervalSeconds > 0.0f; });
