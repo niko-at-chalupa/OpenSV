@@ -150,6 +150,9 @@ juce::Result readPitchAttributes(const juce::var& value, PitchAttributes& attrib
             extra.getDynamicObject()->removeProperty(field.name);
         }
     }
+    extra.getDynamicObject()->removeProperty("vocalModeInherited");
+    extra.getDynamicObject()->removeProperty("vocalModePreset");
+    extra.getDynamicObject()->removeProperty("vocalModeParams");
     attributes.preservedFieldsJson = juce::JSON::toString(extra, true, std::numeric_limits<double>::max_digits10).toStdString();
     return juce::Result::ok();
 }
@@ -207,7 +210,7 @@ juce::Result readGroup(const juce::var& value, NoteGroup& group)
     parameters.getDynamicObject()->removeProperty("pitchDelta");
     parameters.getDynamicObject()->removeProperty("vibratoEnv");
     set(extra, "parameters", parameters);
-    group.preservedFieldsJson = preserve(extra, {"uuid", "name", "notes"});
+    group.preservedFieldsJson = preserve(extra, {"uuid", "name", "notes", "vocalModes"});
     for (const auto& item : *value["notes"].getArray())
     {
         Note note;
@@ -260,7 +263,62 @@ juce::Result readGroup(const juce::var& value, NoteGroup& group)
     {
         return result;
     }
-    return readCurve(value["parameters"]["vibratoEnv"], group.vibratoEnv, "vibratoEnv");
+    if (const auto result = readCurve(value["parameters"]["vibratoEnv"], group.vibratoEnv, "vibratoEnv"); result.failed())
+    {
+        return result;
+    }
+    const auto& modes = value["vocalModes"];
+    if (!modes.isVoid() && !modes.isObject())
+    {
+        return invalid("vocalModes must be an object of mode curves.");
+    }
+    if (const auto* object = modes.getDynamicObject())
+    {
+        const auto& properties = object->getProperties();
+        for (int index = 0; index < properties.size(); ++index)
+        {
+            const auto name = properties.getName(index).toString().toStdString();
+            const auto& modeValue = properties.getValueAt(index);
+            VocalModeSetting setting;
+            if (isNumber(modeValue))
+            {
+                if (!readNumber(modes, properties.getName(index), setting.amount))
+                {
+                    return invalid("vocalModes." + utf8(name) + " must have a finite amount.");
+                }
+            }
+            else if (modeValue.isObject())
+            {
+                if (modeValue.hasProperty("enabled"))
+                {
+                    if (!modeValue["enabled"].isBool())
+                    {
+                        return invalid("vocalModes." + utf8(name) + ".enabled must be a boolean.");
+                    }
+                    setting.enabled = static_cast<bool>(modeValue["enabled"]);
+                }
+                if (modeValue.hasProperty("amount") && !readNumber(modeValue, "amount", setting.amount))
+                {
+                    return invalid("vocalModes." + utf8(name) + ".amount must be a finite number.");
+                }
+                if (modeValue.hasProperty("mode") || modeValue.hasProperty("points"))
+                {
+                    if (const auto result = readCurve(modeValue, setting.curve, "vocalModes." + utf8(name)); result.failed())
+                    {
+                        return result;
+                    }
+                    setting.hasCurve = true;
+                }
+                setting.preservedFieldsJson = preserve(modeValue, {"enabled", "amount", "mode", "points"});
+            }
+            else
+            {
+                return invalid("vocalModes." + utf8(name) + " must be an amount or settings object.");
+            }
+            group.vocalModes.emplace(name, std::move(setting));
+        }
+    }
+    return juce::Result::ok();
 }
 
 juce::Result readReference(const juce::var& value, GroupReference& reference, const juce::File& directory)
@@ -294,7 +352,47 @@ juce::Result readReference(const juce::var& value, GroupReference& reference, co
             reference.audioFile = directory.getChildFile(filename).getFullPathName().toStdString();
         }
     }
-    if (const auto result = readPitchAttributes(value["voice"], reference.voicePitch, "reference voice"); result.failed())
+    const auto& voice = value["voice"];
+    if (!voice.isVoid() && !voice.isObject())
+    {
+        return invalid("a group reference's voice settings must be an object.");
+    }
+    if (voice.hasProperty("vocalModeInherited"))
+    {
+        if (!voice["vocalModeInherited"].isBool())
+        {
+            return invalid("vocalModeInherited must be a boolean.");
+        }
+        reference.vocalModeInherited = static_cast<bool>(voice["vocalModeInherited"]);
+    }
+    if (voice.hasProperty("vocalModePreset"))
+    {
+        if (!voice["vocalModePreset"].isString())
+        {
+            return invalid("vocalModePreset must be a string.");
+        }
+        reference.vocalModePreset = voice["vocalModePreset"].toString().toStdString();
+    }
+    const auto& modeParams = voice["vocalModeParams"];
+    if (!modeParams.isVoid() && !modeParams.isObject())
+    {
+        return invalid("vocalModeParams must be an object of mode amounts.");
+    }
+    if (const auto* object = modeParams.getDynamicObject())
+    {
+        const auto& properties = object->getProperties();
+        for (int index = 0; index < properties.size(); ++index)
+        {
+            double amount = 0.0;
+            const auto name = properties.getName(index).toString().toStdString();
+            if (!readNumber(modeParams, properties.getName(index), amount))
+            {
+                return invalid("vocalModeParams." + utf8(name) + " must be a finite number.");
+            }
+            reference.vocalModeParams.emplace(name, amount);
+        }
+    }
+    if (const auto result = readPitchAttributes(voice, reference.voicePitch, "reference voice"); result.failed())
     {
         return result;
     }
@@ -457,7 +555,21 @@ juce::var writeGroup(const NoteGroup& group)
     set(parameters, "pitchDelta", writeCurve(group.pitchDelta));
     set(parameters, "vibratoEnv", writeCurve(group.vibratoEnv));
     set(value, "parameters", parameters);
-    setDefault(value, "vocalModes", makeObject());
+    auto vocalModes = makeObject();
+    for (const auto& [name, setting] : group.vocalModes)
+    {
+        auto mode = retainedObject(setting.preservedFieldsJson);
+        set(mode, "enabled", setting.enabled);
+        set(mode, "amount", setting.amount);
+        if (setting.hasCurve)
+        {
+            auto curve = writeCurve(setting.curve);
+            set(mode, "mode", curve["mode"]);
+            set(mode, "points", curve["points"]);
+        }
+        set(vocalModes, juce::Identifier(utf8(name)), mode);
+    }
+    set(value, "vocalModes", vocalModes);
     return value;
 }
 
@@ -479,9 +591,14 @@ juce::var writeReference(const GroupReference& reference, const juce::File& dire
     set(value, "database", database);
     setDefault(value, "dictionary", "");
     auto voice = writePitchAttributes(reference.voicePitch);
-    setDefault(voice, "vocalModeInherited", true);
-    setDefault(voice, "vocalModePreset", "");
-    setDefault(voice, "vocalModeParams", makeObject());
+    set(voice, "vocalModeInherited", reference.vocalModeInherited);
+    set(voice, "vocalModePreset", utf8(reference.vocalModePreset));
+    auto modeParams = makeObject();
+    for (const auto& [name, amount] : reference.vocalModeParams)
+    {
+        set(modeParams, juce::Identifier(utf8(name)), amount);
+    }
+    set(voice, "vocalModeParams", modeParams);
     set(value, "voice", voice);
     setDefault(value, "pitchTakes", defaultTakes());
     setDefault(value, "timbreTakes", defaultTakes());

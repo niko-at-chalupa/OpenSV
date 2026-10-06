@@ -90,6 +90,10 @@ try
         return result;
     }
     VoiceSynthesizer candidate;
+    for (const auto& style : database.getMetadata().timbreStyles)
+    {
+        candidate.vocalModeNames.push_back(style.toStdString());
+    }
     for (const auto& language : juce::StringArray::fromTokens(database.getMetadata().properties[".feature_rap_languages"], false))
     {
         candidate.rapLanguages.push_back(language.toStdString());
@@ -132,7 +136,7 @@ try
         {
             return result;
         }
-        if (const auto result = candidate.acoustic.load(reader); result.failed())
+        if (const auto result = candidate.acoustic.load(reader, candidate.vocalModeNames); result.failed())
         {
             return result;
         }
@@ -168,6 +172,11 @@ float VoiceSynthesizer::getFrameIntervalSeconds() const noexcept
 float VoiceSynthesizer::getPitchFrameIntervalSeconds() const noexcept
 {
     return pitch.getFrameIntervalSeconds();
+}
+
+const std::vector<std::string>& VoiceSynthesizer::getVocalModeNames() const noexcept
+{
+    return vocalModeNames;
 }
 
 juce::Result VoiceSynthesizer::predictPitch(std::span<const PitchNote> notes, std::vector<float>& midiPitch, const std::function<bool()>& shouldCancel, SynthesisStatistics* statistics, State* state, std::span<const float> vibratoEnvelope) const
@@ -238,7 +247,7 @@ catch (const std::bad_alloc&)
     return juce::Result::fail("Voice synthesizer: insufficient memory to predict phoneme timing");
 }
 
-juce::Result VoiceSynthesizer::render(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, NeuralVocoderOutput& output, std::uint32_t seed, const std::function<bool()>& shouldCancel, SynthesisStatistics* statistics, State* state) const
+juce::Result VoiceSynthesizer::render(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, NeuralVocoderOutput& output, std::uint32_t seed, const std::function<bool()>& shouldCancel, SynthesisStatistics* statistics, State* state, std::span<const float> vocalModeWeights) const
 try
 {
     DnniRunStatistics networkStatistics;
@@ -260,7 +269,7 @@ try
     }
     DnniTensor frames;
     const double acousticStarted = juce::Time::getMillisecondCounterHiRes();
-    const auto acousticResult = acoustic.run(phonemes, logF0, frames, seed, state != nullptr ? &state->acoustic : nullptr, shouldCancel, &networkStatistics);
+    const auto acousticResult = acoustic.run(phonemes, logF0, frames, seed, state != nullptr ? &state->acoustic : nullptr, shouldCancel, &networkStatistics, vocalModeWeights);
     if (statistics != nullptr)
     {
         statistics->acousticMilliseconds += juce::Time::getMillisecondCounterHiRes() - acousticStarted;

@@ -359,6 +359,114 @@ std::vector<float> buildVibratoEnvelope(const Project& project, std::span<const 
     return envelope;
 }
 
+bool referenceHasVocalModes(const GroupReference& reference)
+{
+    return !reference.vocalModePreset.empty() || !reference.vocalModeParams.empty();
+}
+
+bool phraseHasVocalModes(const Track& track, std::span<const RenderNote> notes)
+{
+    if (referenceHasVocalModes(track.mainRef))
+    {
+        return true;
+    }
+    return std::any_of(notes.begin(), notes.end(), [](const RenderNote& note)
+                       { return referenceHasVocalModes(*note.reference) || !note.group->vocalModes.empty(); });
+}
+
+juce::Result buildVocalModeWeights(const Project& project, const Track& track, std::span<const RenderNote> notes, double startSeconds, double frameIntervalSeconds, std::size_t frameCount, std::span<const std::string> modeNames, std::vector<float>& output)
+{
+    if (!phraseHasVocalModes(track, notes))
+    {
+        output.clear();
+        return juce::Result::ok();
+    }
+    if (modeNames.empty())
+    {
+        return juce::Result::fail("The selected voice does not expose vocal-mode style vectors required by this project.");
+    }
+    if (modeNames.size() > (128 * 1024 * 1024) / sizeof(float) / std::max<std::size_t>(frameCount, 1))
+    {
+        return juce::Result::fail("Vocal-mode automation exceeds the phrase memory limit.");
+    }
+    const auto modeIndex = [&modeNames](const std::string& name) -> std::optional<std::size_t>
+    {
+        const auto found = std::find(modeNames.begin(), modeNames.end(), name);
+        if (found == modeNames.end())
+        {
+            return std::nullopt;
+        }
+        return static_cast<std::size_t>(std::distance(modeNames.begin(), found));
+    };
+    output.assign(frameCount * modeNames.size(), 0.0f);
+    std::size_t noteIndex = 0;
+    for (std::size_t frame = 0; frame < frameCount; ++frame)
+    {
+        const double seconds = startSeconds + (static_cast<double>(frame) + 0.5) * frameIntervalSeconds;
+        while (noteIndex + 1 < notes.size() && seconds >= notes[noteIndex + 1].startSeconds)
+        {
+            ++noteIndex;
+        }
+        const auto& note = notes[noteIndex];
+        const GroupReference* settings = note.reference;
+        if (settings == &track.mainRef)
+        {
+            if (settings->vocalModeInherited)
+            {
+                settings = nullptr;
+            }
+        }
+        else if (settings->vocalModeInherited)
+        {
+            settings = track.mainRef.vocalModeInherited ? nullptr : &track.mainRef;
+        }
+        auto* weights = output.data() + frame * modeNames.size();
+        if (settings != nullptr)
+        {
+            if (!settings->vocalModePreset.empty() && settings->vocalModePreset != "Default" && settings->vocalModePreset != "default")
+            {
+                const auto preset = modeIndex(settings->vocalModePreset);
+                if (!preset.has_value())
+                {
+                    return juce::Result::fail("Vocal-mode preset '" + juce::String::fromUTF8(settings->vocalModePreset.c_str()) + "' is not a style exposed by the selected voice.");
+                }
+                weights[*preset] = 1.0f;
+            }
+            for (const auto& [name, amount] : settings->vocalModeParams)
+            {
+                const auto index = modeIndex(name);
+                if (!index.has_value())
+                {
+                    return juce::Result::fail("Vocal mode '" + juce::String::fromUTF8(name.c_str()) + "' is not exposed by the selected voice.");
+                }
+                weights[*index] = static_cast<float>(std::clamp(amount, 0.0, 1.0));
+            }
+        }
+        const auto position = localCurvePosition(project.tempoMap.secondsToBlick(seconds), note.reference->timeOffset);
+        for (const auto& [name, setting] : note.group->vocalModes)
+        {
+            const auto index = modeIndex(name);
+            if (!index.has_value())
+            {
+                return juce::Result::fail("Vocal-mode curve '" + juce::String::fromUTF8(name.c_str()) + "' is not exposed by the selected voice.");
+            }
+            if (!setting.enabled)
+            {
+                weights[*index] = 0.0f;
+            }
+            else if (setting.hasCurve)
+            {
+                weights[*index] = static_cast<float>(std::clamp(sampleParameterCurve(setting.curve, position, setting.amount), 0.0, 1.0));
+            }
+            else
+            {
+                weights[*index] = static_cast<float>(std::clamp(setting.amount, 0.0, 1.0));
+            }
+        }
+    }
+    return juce::Result::ok();
+}
+
 juce::Result buildPitch(const Project& project, std::span<const RenderNote> notes, double startSeconds, float frameIntervalSeconds, std::size_t frameCount, std::span<const float> automaticPitch, double pitchStartSeconds, float pitchFrameIntervalSeconds, std::vector<float>& logF0)
 {
     std::vector<synthesis::PitchCurveNote> editorNotes;
@@ -833,7 +941,7 @@ bool ProjectRenderer::matchesTiming(const CachedPhrase& cached, const FileStamp&
 
 std::size_t ProjectRenderer::phraseBytes(const CachedPhrase& phrase)
 {
-    std::size_t bytes = sizeof(CachedPhrase) + (phrase.samples.capacity() + phrase.logF0.capacity() + phrase.pitchEnvelope.capacity() + phrase.automaticPitch.capacity()) * sizeof(float) + phrase.syllables.capacity() * sizeof(synthesis::TimingSyllable) + phrase.phonemes.capacity() * sizeof(synthesis::TimedPhoneme) + phrase.pitchNotes.capacity() * sizeof(synthesis::PitchNote);
+    std::size_t bytes = sizeof(CachedPhrase) + (phrase.samples.capacity() + phrase.logF0.capacity() + phrase.pitchEnvelope.capacity() + phrase.vocalModeWeights.capacity() + phrase.automaticPitch.capacity()) * sizeof(float) + phrase.syllables.capacity() * sizeof(synthesis::TimingSyllable) + phrase.phonemes.capacity() * sizeof(synthesis::TimedPhoneme) + phrase.pitchNotes.capacity() * sizeof(synthesis::PitchNote);
     bytes += phrase.voiceSource.file.getFullPathName().getNumBytesAsUTF8();
     if (phrase.visualization != nullptr)
     {
@@ -1278,6 +1386,21 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 {
                     return trackError(track, "The predicted phrase exceeds the 30-second inference limit.");
                 }
+                std::vector<float> vocalModeWeights;
+                if (phraseHasVocalModes(track, notes))
+                {
+                    if (voice == nullptr)
+                    {
+                        if (const auto result = findVoice(voiceSource, voice); result.failed())
+                        {
+                            return trackError(track, result.getErrorMessage());
+                        }
+                    }
+                    if (const auto result = buildVocalModeWeights(project, track, notes, startSeconds, frameInterval, frameCount, voice->getVocalModeNames(), vocalModeWeights); result.failed())
+                    {
+                        return trackError(track, result.getErrorMessage());
+                    }
+                }
                 auto inference = takeInference(voiceSource, track.mainGroup.id, notes.front().start);
                 const juce::ScopeGuard retainState([this, &inference]() noexcept
                                                    {
@@ -1343,8 +1466,8 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 {
                     return trackError(track, result.getErrorMessage());
                 }
-                const auto cached = std::find_if(phrases.begin(), phrases.end(), [&voiceSource, &syllables, &logF0](const CachedPhrase& entry)
-                                                 { return matchesTiming(entry, voiceSource, syllables) && entry.logF0 == logF0; });
+                const auto cached = std::find_if(phrases.begin(), phrases.end(), [&voiceSource, &syllables, &logF0, &vocalModeWeights](const CachedPhrase& entry)
+                                                 { return matchesTiming(entry, voiceSource, syllables) && entry.logF0 == logF0 && entry.vocalModeWeights == vocalModeWeights; });
                 if (cached != phrases.end())
                 {
                     ++statistics.reusedPhrases;
@@ -1390,7 +1513,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 {
                     // Each network commits only complete results. Even if a later
                     // stage is cancelled, those independent cache entries remain valid.
-                    const auto result = voice->render(phonemes, logF0, rendered, 5489, shouldCancel, &statistics.synthesis, &inference.state);
+                    const auto result = voice->render(phonemes, logF0, rendered, 5489, shouldCancel, &statistics.synthesis, &inference.state, vocalModeWeights);
                     if (result.failed())
                     {
                         return trackError(track, noteContext(notes.front()) + result.getErrorMessage());
@@ -1412,7 +1535,7 @@ juce::Result ProjectRenderer::render(const Project& project, double sampleRate, 
                 ++statistics.renderedPhrases;
                 // Cache only complete native mono output. Mixer settings, track/note
                 // identities and placement do not participate in neural inference.
-                retainPhrase({voiceSource, std::move(syllables), std::move(phonemes), std::move(pitchNotes), std::move(pitchEnvelope), std::move(automaticPitch), pitchFrameInterval, std::move(logF0), frameInterval, rendered.sampleRate, std::move(rendered.samples), std::move(display), 0});
+                retainPhrase({voiceSource, std::move(syllables), std::move(phonemes), std::move(pitchNotes), std::move(pitchEnvelope), std::move(vocalModeWeights), std::move(automaticPitch), pitchFrameInterval, std::move(logF0), frameInterval, rendered.sampleRate, std::move(rendered.samples), std::move(display), 0});
                 begin = end;
             }
             return juce::Result::ok();

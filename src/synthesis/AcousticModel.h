@@ -34,12 +34,13 @@ public:
     };
 
     [[nodiscard]] juce::Result load(const DnniReader& reader, std::size_t rootNode = 0);
+    [[nodiscard]] juce::Result load(const DnniReader& reader, std::span<const std::string> vocalModeNames, std::size_t rootNode = 0);
     // Whole-utterance inference with the database's default vocal mode and supplied timing/F0.
     // The seed selects our deterministic noise stream, not the original editor's retake schedule.
-    [[nodiscard]] juce::Result run(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, DnniTensor& output, std::uint32_t noiseSeed = 5489, State* state = nullptr, const std::function<bool()>& shouldCancel = {}, DnniRunStatistics* statistics = nullptr) const;
+    [[nodiscard]] juce::Result run(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, DnniTensor& output, std::uint32_t noiseSeed = 5489, State* state = nullptr, const std::function<bool()>& shouldCancel = {}, DnniRunStatistics* statistics = nullptr, std::span<const float> vocalModeWeights = {}) const;
 
 private:
-    [[nodiscard]] juce::Result makeContext(std::span<const TimedPhoneme> phonemes, const DnniTensor& pitch, DnniTensor& output, State* state, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics) const;
+    [[nodiscard]] juce::Result makeContext(std::span<const TimedPhoneme> phonemes, const DnniTensor& pitch, DnniTensor& output, State* state, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics, std::span<const float> vocalModeWeights) const;
     [[nodiscard]] juce::Result sampleLatent(const DnniTensor& context, const DnniTensor& projected, std::uint32_t noiseSeed, DnniTensor& output, State* state, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics) const;
 
     AcousticFeatures features;
@@ -56,6 +57,7 @@ private:
     DnniMatrix languageEmbedding;
     std::vector<float> speaker;
     std::vector<float> defaultStyle;
+    std::vector<std::vector<float>> vocalModeStyles;
     bool loaded = false;
 };
 } // namespace sv::synthesis

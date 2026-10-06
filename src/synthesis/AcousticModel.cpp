@@ -92,6 +92,11 @@ std::size_t AcousticModel::State::getBytes() const noexcept
 }
 
 juce::Result AcousticModel::load(const DnniReader& reader, std::size_t rootNode)
+{
+    return load(reader, std::span<const std::string>{}, rootNode);
+}
+
+juce::Result AcousticModel::load(const DnniReader& reader, std::span<const std::string> vocalModeNames, std::size_t rootNode)
 try
 {
     const auto& nodes = reader.getNodes();
@@ -140,6 +145,24 @@ try
     {
         return result;
     }
+    if (!vocalModeNames.empty() && styleVectors.children.size() - 1 != vocalModeNames.size())
+    {
+        return fail("voice timbre-style metadata does not match the acoustic model style vectors");
+    }
+    candidate.vocalModeStyles.reserve(vocalModeNames.size());
+    for (std::size_t index = 0; index < vocalModeNames.size(); ++index)
+    {
+        std::vector<float> modeStyle;
+        if (auto result = reader.readFloatVector(styleVectors.children[index + 1], modeStyle); result.failed())
+        {
+            return result;
+        }
+        if (modeStyle.size() != candidate.defaultStyle.size())
+        {
+            return fail("a vocal-mode style vector has an unsupported dimension");
+        }
+        candidate.vocalModeStyles.push_back(std::move(modeStyle));
+    }
     if (auto result = reader.readFloatMatrix(embedding.children[0], candidate.languageEmbedding); result.failed())
     {
         return result;
@@ -176,7 +199,7 @@ catch (const std::bad_alloc&)
     return fail("insufficient memory to load model parameters");
 }
 
-juce::Result AcousticModel::makeContext(std::span<const TimedPhoneme> phonemes, const DnniTensor& pitch, DnniTensor& output, State* state, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics) const
+juce::Result AcousticModel::makeContext(std::span<const TimedPhoneme> phonemes, const DnniTensor& pitch, DnniTensor& output, State* state, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics, std::span<const float> vocalModeWeights) const
 {
     DnniTensor phoneFeatures;
     if (auto result = features.encodePhonemes(phonemes, phoneFeatures); result.failed())
@@ -226,7 +249,16 @@ juce::Result AcousticModel::makeContext(std::span<const TimedPhoneme> phonemes, 
             {
                 destination[static_cast<std::ptrdiff_t>(104 + channel)] = languageEmbedding.values[channel * languageEmbedding.columns + language];
             }
-            std::copy(defaultStyle.begin(), defaultStyle.end(), destination + 112);
+            auto styleDestination = destination + 112;
+            std::copy(defaultStyle.begin(), defaultStyle.end(), styleDestination);
+            for (std::size_t mode = 0; mode < vocalModeStyles.size(); ++mode)
+            {
+                const float weight = vocalModeWeights.empty() ? 0.0f : vocalModeWeights[frame * vocalModeStyles.size() + mode];
+                for (std::size_t channel = 0; channel < defaultStyle.size(); ++channel)
+                {
+                    styleDestination[static_cast<std::ptrdiff_t>(channel)] += weight * (vocalModeStyles[mode][channel] - defaultStyle[channel]);
+                }
+            }
         }
     }
     output = std::move(context);
@@ -285,7 +317,7 @@ juce::Result AcousticModel::sampleLatent(const DnniTensor& context, const DnniTe
     return latentHead.run(hidden, output, nullptr, state != nullptr ? &state->latentHead : nullptr, shouldCancel, statistics);
 }
 
-juce::Result AcousticModel::run(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, DnniTensor& output, std::uint32_t noiseSeed, State* state, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics) const
+juce::Result AcousticModel::run(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, DnniTensor& output, std::uint32_t noiseSeed, State* state, const std::function<bool()>& shouldCancel, DnniRunStatistics* statistics, std::span<const float> vocalModeWeights) const
 try
 {
     if (!loaded)
@@ -309,6 +341,16 @@ try
     {
         return fail("one log-F0 value is required for each phoneme frame");
     }
+    const auto expectedModeWeights = frames * vocalModeStyles.size();
+    if (!vocalModeWeights.empty() && vocalModeWeights.size() != expectedModeWeights)
+    {
+        return fail("vocal-mode automation dimensions do not match the phrase frame count");
+    }
+    if (!std::all_of(vocalModeWeights.begin(), vocalModeWeights.end(), [](float amount)
+                     { return std::isfinite(amount); }))
+    {
+        return fail("vocal-mode automation contains a non-finite amount");
+    }
     DnniTensor pitch;
     if (auto result = features.normalizeLogF0(logF0, pitch); result.failed())
     {
@@ -319,7 +361,7 @@ try
         return result;
     }
     DnniTensor frameFeatures;
-    if (auto result = makeContext(phonemes, pitch, frameFeatures, state, shouldCancel, statistics); result.failed())
+    if (auto result = makeContext(phonemes, pitch, frameFeatures, state, shouldCancel, statistics, vocalModeWeights); result.failed())
     {
         return result;
     }

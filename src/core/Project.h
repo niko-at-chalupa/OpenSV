@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -61,6 +62,15 @@ struct ParameterCurve
     std::string preservedFieldsJson;
 };
 
+struct VocalModeSetting
+{
+    bool enabled = true;
+    double amount = 0.0;
+    bool hasCurve = false;
+    ParameterCurve curve;
+    std::string preservedFieldsJson;
+};
+
 struct NoteGroup
 {
     std::string id;
@@ -69,6 +79,7 @@ struct NoteGroup
     ParameterCurve pitchDelta;
     std::string preservedFieldsJson;
     ParameterCurve vibratoEnv;
+    std::map<std::string, VocalModeSetting> vocalModes;
 };
 
 struct GroupReference
@@ -84,6 +95,9 @@ struct GroupReference
     std::string preservedFieldsJson;
     PitchAttributes voicePitch;
     ParameterCurve systemPitchDelta;
+    bool vocalModeInherited = true;
+    std::string vocalModePreset;
+    std::map<std::string, double> vocalModeParams;
 };
 
 struct VoiceSettings

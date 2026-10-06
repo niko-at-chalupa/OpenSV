@@ -21,6 +21,10 @@ std::size_t curveStorageBytes(const ParameterCurve& curve)
 std::size_t groupBytes(const NoteGroup& group)
 {
     std::size_t bytes = sizeof(group) + group.id.size() + group.name.size() + group.preservedFieldsJson.size() + curveStorageBytes(group.pitchDelta) + curveStorageBytes(group.vibratoEnv);
+    for (const auto& [name, curve] : group.vocalModes)
+    {
+        bytes += name.size() + curveStorageBytes(curve.curve) + curve.preservedFieldsJson.size();
+    }
     for (const auto& note : group.notes)
     {
         bytes += sizeof(note) + note.lyrics.size() + note.phonemes.size() + note.preservedFieldsJson.size();
@@ -31,7 +35,13 @@ std::size_t groupBytes(const NoteGroup& group)
 
 std::size_t referenceBytes(const GroupReference& reference)
 {
-    return sizeof(reference) + reference.groupId.size() + reference.audioFile.size() + reference.preservedFieldsJson.size() + reference.voicePitch.preservedFieldsJson.size() + curveStorageBytes(reference.systemPitchDelta);
+    std::size_t bytes = sizeof(reference) + reference.groupId.size() + reference.audioFile.size() + reference.preservedFieldsJson.size() + reference.voicePitch.preservedFieldsJson.size() + reference.vocalModePreset.size() + curveStorageBytes(reference.systemPitchDelta);
+    for (const auto& [name, amount] : reference.vocalModeParams)
+    {
+        static_cast<void>(amount);
+        bytes += name.size() + sizeof(double);
+    }
+    return bytes;
 }
 
 std::size_t projectBytes(const Project& project)

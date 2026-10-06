@@ -42,6 +42,7 @@ public:
     // Returns zero until a voice has been loaded successfully.
     [[nodiscard]] float getFrameIntervalSeconds() const noexcept;
     [[nodiscard]] float getPitchFrameIntervalSeconds() const noexcept;
+    [[nodiscard]] const std::vector<std::string>& getVocalModeNames() const noexcept;
     [[nodiscard]] juce::Result predict(std::span<const TimingSyllable> syllables, std::vector<PhonemeDuration>& output) const;
     // Takes score notes and internal rests, without acoustic preroll/release.
     // Predicts phoneme timing independently in the pitch model's context.
@@ -50,7 +51,7 @@ public:
     [[nodiscard]] juce::Result predictPitch(std::span<const PitchNote> notes, std::vector<float>& midiPitch, const std::function<bool()>& shouldCancel = {}, SynthesisStatistics* statistics = nullptr, State* state = nullptr, std::span<const float> vibratoEnvelope = {}) const;
     // The cancellation callback runs synchronously between inference stages and blocks.
     // Outputs are owned by the caller and replaced only on success.
-    [[nodiscard]] juce::Result render(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, NeuralVocoderOutput& output, std::uint32_t seed = 5489, const std::function<bool()>& shouldCancel = {}, SynthesisStatistics* statistics = nullptr, State* state = nullptr) const;
+    [[nodiscard]] juce::Result render(std::span<const TimedPhoneme> phonemes, std::span<const float> logF0, NeuralVocoderOutput& output, std::uint32_t seed = 5489, const std::function<bool()>& shouldCancel = {}, SynthesisStatistics* statistics = nullptr, State* state = nullptr, std::span<const float> vocalModeWeights = {}) const;
 
 private:
     PhonemeTiming timing;
@@ -58,6 +59,7 @@ private:
     AcousticModel acoustic;
     NeuralVocoder vocoder;
     std::vector<std::string> rapLanguages;
+    std::vector<std::string> vocalModeNames;
     float frameIntervalSeconds = 0.0f;
 };
 } // namespace sv::synthesis

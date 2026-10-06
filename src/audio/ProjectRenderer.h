@@ -66,6 +66,8 @@ private:
         // larger network snapshots and loaded-model LRU lifetimes.
         std::vector<synthesis::PitchNote> pitchNotes;
         std::vector<float> pitchEnvelope;
+        // Frame-major voice timbre-mode weights used by acoustic inference.
+        std::vector<float> vocalModeWeights;
         std::vector<float> automaticPitch;
         float pitchFrameIntervalSeconds = 0.0f;
         std::vector<float> logF0;
