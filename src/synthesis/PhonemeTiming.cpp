@@ -184,7 +184,7 @@ juce::Result quantizePhonemeDurations(std::span<const PhonemeDuration> durations
             static_cast<double>(previousFrame + 1),
             std::round(cumulativeSeconds / static_cast<double>(frameIntervalSeconds))));
 
-        output.push_back({duration.language, duration.symbol, previousFrame, targetFrame});
+        output.push_back({duration.language, duration.symbol, targetFrame - previousFrame});
         previousFrame = targetFrame;
     }
 
